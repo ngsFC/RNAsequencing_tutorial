@@ -1,0 +1,16 @@
+# Rendered output (regenerate by knitting the .Rmd files)
+# Pre-rendered copies are intentionally committed under html/.
+*.html
+!html/*.html
+*.knit.md
+*.utf8.md
+
+# Raw per-sample downloads used once to build data/TARGET_WT_*.csv -- not committed
+data-prep/raw_downloads/
+
+# R session / project files
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj

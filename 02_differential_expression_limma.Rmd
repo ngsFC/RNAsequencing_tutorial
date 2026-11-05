@@ -1,0 +1,573 @@
+---
+title: "Module 2 — Differential Expression with limma"
+subtitle: "RNA-seq Tutorial: Linear Models, Contrasts and Empirical Bayes, Step by Step"
+author:
+  - "**Francesco Cecere** · *Senior Bioinformatic Researcher* · AORN Santobono-Pausilipon IRCCS"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: hide
+    fig_width: 10
+    fig_height: 6
+---
+
+<style>
+body { font-size: 15px; }
+
+h1 {
+  border-bottom: 3px solid #2980b9;
+  padding-bottom: 8px;
+  color: #1a252f;
+  margin-top: 32px;
+}
+h2 {
+  border-bottom: 1px solid #aed6f1;
+  padding-bottom: 4px;
+  color: #2471a3;
+  margin-top: 22px;
+}
+h3 { color: #1f618d; }
+
+blockquote {
+  background-color: #eaf4fd;
+  border-left: 5px solid #2980b9;
+  padding: 14px 20px;
+  border-radius: 0 6px 6px 0;
+  font-style: italic;
+  color: #2c3e50;
+  margin: 18px 0;
+}
+blockquote p { margin: 0; }
+
+.value-boxes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin: 24px 0 32px 0;
+}
+.vbox {
+  background-color: #2980b9;
+  background: linear-gradient(135deg, #2980b9 0%, #1a5276 100%);
+  color: #ffffff !important;
+  border-radius: 10px;
+  padding: 20px 28px;
+  min-width: 150px;
+  text-align: center;
+  box-shadow: 0 3px 10px rgba(0,0,0,0.15);
+  flex: 1;
+  transition: transform 0.2s;
+}
+.vbox:hover { transform: translateY(-3px); }
+.vbox.green  { background-color: #27ae60; background: linear-gradient(135deg, #27ae60 0%, #1e8449 100%); }
+.vbox.red    { background-color: #e74c3c; background: linear-gradient(135deg, #e74c3c 0%, #a93226 100%); }
+.vbox.purple { background-color: #8e44ad; background: linear-gradient(135deg, #8e44ad 0%, #6c3483 100%); }
+.vbox .vbox-number, .vbox-number {
+  font-size: 2.6em; font-weight: 700; line-height: 1.1; color: #ffffff !important;
+}
+.vbox .vbox-label, .vbox-label {
+  font-size: 0.82em; margin-top: 5px; opacity: 0.92; letter-spacing: 0.02em; color: #ffffff !important;
+}
+
+.alert-sig {
+  background: #d5f5e3;
+  border-left: 5px solid #27ae60;
+  padding: 12px 18px;
+  border-radius: 0 6px 6px 0;
+  margin: 12px 0;
+}
+.alert-notsig {
+  background: #fdf2f8;
+  border-left: 5px solid #a569bd;
+  padding: 12px 18px;
+  border-radius: 0 6px 6px 0;
+  margin: 12px 0;
+}
+.alert-info {
+  background: #fef9e7;
+  border-left: 5px solid #f39c12;
+  padding: 12px 18px;
+  border-radius: 0 6px 6px 0;
+  margin: 12px 0;
+  color: #7d6608 !important; /* flatly's built-in .alert-info sets color:#fff; override so text is visible on our pale-yellow bg */
+}
+.alert-info strong { color: #7d6608 !important; }
+
+.dataTables_wrapper { margin: 10px 0 24px 0; font-size: 0.93em; }
+table.dataTable thead th {
+  background-color: #2980b9 !important;
+  color: white !important;
+}
+.dt-buttons .btn { font-size: 0.82em; padding: 3px 10px; }
+
+.report-footer {
+  margin-top: 40px;
+  padding-top: 16px;
+  border-top: 1px solid #ccc;
+  font-size: 0.85em;
+  color: #777;
+  text-align: center;
+}
+
+.tocify {
+  background-color: #1a252f !important;
+  border: none !important;
+  border-radius: 8px;
+  padding: 6px 0;
+}
+.tocify .tocify-item > a {
+  color: #bdc3c7 !important;
+  padding: 6px 14px;
+  font-size: 0.88em;
+  border-radius: 4px;
+  transition: background 0.18s, color 0.18s;
+  text-decoration: none;
+}
+.tocify .tocify-item > a:hover {
+  background-color: #2c3e50 !important;
+  color: #ffffff !important;
+}
+.tocify .tocify-item.active > a {
+  background-color: #2980b9 !important;
+  color: #ffffff !important;
+  font-weight: 600;
+  border-radius: 4px;
+}
+.tocify-subheader {
+  background-color: #1a252f !important;
+}
+.tocify-subheader .tocify-item > a {
+  padding-left: 26px !important;
+  font-size: 0.82em !important;
+  color: #7f8c8d !important;
+}
+.tocify-subheader .tocify-item.active > a {
+  background-color: #21618c !important;
+  color: #ecf0f1 !important;
+}
+</style>
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = FALSE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center",
+  dpi       = 96
+)
+```
+
+```{r libraries, include=FALSE}
+library(limma)       # linear models + empirical Bayes for differential expression
+library(tidyverse)   # loaded after limma, so dplyr verbs are not masked
+library(DT)          # interactive downloadable tables
+library(knitr)       # kable for simple inline tables
+library(pheatmap)    # clustered heatmaps
+library(ggrepel)     # non-overlapping gene labels
+```
+
+# From Module 1
+
+Module 1 built one matrix of log2(TPM + 1) for 124 Wilms tumors and 6 normal kidneys, and showed that tumor vs normal is the dominant signal while the two histologies overlap. This module asks, gene by gene, **which genes change**, and explains each step of **limma** along the way.
+
+**Plan:** the linear model → design matrix → contrasts → fitting → empirical Bayes moderation → reading the results → testing a fold-change threshold properly (`treat`) → paired samples (`duplicateCorrelation`) → Unfavorable vs Favorable.
+
+```{r load-data, echo=TRUE}
+# Same import, matching and filtering as Module 1.
+tumor_tpm   <- read_csv("data/TARGET_WT_gene_expression_tpm.csv", show_col_types = FALSE)
+control_tpm <- read_csv("data/TARGET_WT_control_gene_expression_tpm.csv", show_col_types = FALSE)
+tumor_metadata   <- read_csv("data/sample_metadata.csv", show_col_types = FALSE)
+control_metadata <- read_csv("data/TARGET_WT_control_clinical_raw.csv", show_col_types = FALSE)
+
+stopifnot(identical(tumor_tpm$gene_name, control_tpm$gene_name))
+tpm <- as.matrix(bind_cols(tumor_tpm[, -1], control_tpm[, -1]))
+rownames(tpm) <- tumor_tpm$gene_name
+
+samples <- bind_rows(
+  tumor_metadata %>% transmute(sample_id = case_submitter_id, patient = case_submitter_id, group = histologic_subtype),
+  control_metadata %>% transmute(sample_id = sample_submitter_id, patient = case_submitter_id, group = "Control")
+) %>%
+  mutate(group = factor(group, levels = c("Control", "Favorable", "Unfavorable")))
+samples <- samples[match(colnames(tpm), samples$sample_id), ]
+stopifnot(identical(samples$sample_id, colnames(tpm)))
+
+keep     <- rowSums(tpm >= 1) >= min(table(samples$group))
+log_expr <- log2(tpm[keep, ] + 1)
+
+group_colors <- c(Control = "#7f8c8d", Favorable = "#2980b9", Unfavorable = "#e74c3c")
+```
+
+# Part 1 — One Linear Model per Gene
+
+limma fits, **separately for every gene** $g$, a linear model of its log expression in sample $j$:
+
+$$
+y_{gj} = \mathbf{x}_j^\top \boldsymbol{\beta}_g + \varepsilon_{gj}, \qquad \varepsilon_{gj} \sim N(0, \sigma_g^2)
+$$
+
+- $\mathbf{x}_j$ describes sample $j$ (which group it belongs to): one row of the **design matrix**, the same for every gene.
+- $\boldsymbol{\beta}_g$ are the gene's **coefficients**: here, its mean log expression in each group.
+- $\sigma_g^2$ is the gene's residual **variance**: how much samples of the same group differ from one another.
+
+A comparison between groups is then a question about the coefficients, e.g. "is $\beta_{\text{Unfavorable}} - \beta_{\text{Favorable}} = 0$?". The two ideas that make limma powerful are (1) that design and contrasts can describe **any** experiment, and (2) the **empirical Bayes** step of Part 5.
+
+<div class="alert-info">
+**limma-trend vs voom.** limma has two ways to handle RNA-seq. **voom** starts from raw **counts** and computes a precision weight for every observation. **limma-trend** starts from log-expression values and lets the prior variance depend on the gene's average expression (Part 5). With raw counts, voom is preferred; with **TPM**, where counts are no longer available, **limma-trend** is the right choice, and it is what we use here.
+</div>
+
+# Part 2 — The Design Matrix
+
+The design matrix has one row per sample and one column per coefficient. With `~ 0 + group` ("no intercept") each column is a group: a sample gets a 1 in its group's column and 0 elsewhere, so each coefficient is simply **that group's mean**.
+
+```{r design, echo=TRUE}
+design <- model.matrix(~ 0 + group, data = samples)
+colnames(design) <- levels(samples$group)
+```
+
+```{r show-design}
+kable(as_tibble(design) %>% mutate(sample = samples$sample_id, .before = 1) %>%
+        slice(c(1:2, which(samples$group == "Unfavorable")[1:2], which(samples$group == "Control")[1:2])),
+      caption = "Six rows of the design matrix (one per sample).")
+kable(as_tibble(colSums(design), rownames = "column") %>% rename(samples = value),
+      caption = "Samples per column.")
+```
+
+<div class="alert-info">
+**The alternative: `~ group` (with intercept).** Then the first column is the *reference* group (Control) and the others are **differences** from it: "Favorable − Control", "Unfavorable − Control". Both parameterizations fit exactly the same model and give identical results; `~ 0 + group` is just easier to read, and every comparison is written explicitly as a contrast.
+</div>
+
+# Part 3 — Contrasts: Writing Down the Questions
+
+A **contrast** is a combination of coefficients that equals zero if there is no effect. We ask four questions at once:
+
+```{r contrasts, echo=TRUE}
+contrast_matrix <- makeContrasts(
+  Favorable_vs_Control   = Favorable - Control,
+  Unfavorable_vs_Control = Unfavorable - Control,
+  Tumor_vs_Control       = (Favorable + Unfavorable) / 2 - Control,
+  Unfavorable_vs_Favorable = Unfavorable - Favorable,
+  levels = design
+)
+```
+
+```{r show-contrasts}
+kable(contrast_matrix, caption = "Contrast matrix: each column is one question, each row a coefficient.")
+```
+
+- The first two compare each histology with normal kidney.
+- `Tumor_vs_Control` compares the **average of the two tumor groups** with normal kidney: each histology weighs equally, regardless of how many samples it has.
+- `Unfavorable_vs_Favorable` compares the two histologies directly: the clinically most interesting question, and it does not involve the 6 controls at all.
+
+# Part 4 — Fitting the Model
+
+`lmFit()` estimates the coefficients and residual variance of every gene; `contrasts.fit()` turns the coefficients into our four contrasts.
+
+```{r fit, echo=TRUE}
+fit  <- lmFit(log_expr, design)
+fit2 <- contrasts.fit(fit, contrast_matrix)
+```
+
+The coefficients really are group means. For `UMOD`, a gene of mature kidney tubules:
+
+```{r umod-check}
+kable(
+  tibble(group = levels(samples$group),
+         mean_computed_by_hand = tapply(log_expr["UMOD", ], samples$group, mean),
+         coefficient_from_lmFit = fit$coefficients["UMOD", ]) %>%
+    mutate(across(where(is.numeric), ~ round(.x, 3))),
+  caption = "UMOD: mean log2(TPM + 1) per group, by hand and from lmFit."
+)
+```
+
+UMOD is about `r round(fit$coefficients["UMOD", "Control"] - fit$coefficients["UMOD", "Favorable"])` log2 units lower in Favorable tumors than in normal kidney, i.e. roughly `r format(round(2^(fit$coefficients["UMOD", "Control"] - fit$coefficients["UMOD", "Favorable"])), big.mark = ",")`-fold.
+
+# Part 5 — Empirical Bayes: Borrowing Strength Across Genes
+
+To test a contrast we divide it by its standard error, which depends on the gene's variance $s_g^2$. With few samples per group, $s_g^2$ is **unstable**: by chance some genes get a tiny variance and a huge, misleading t-statistic. limma's solution is to assume that the variances of all genes come from a common distribution, estimate that distribution **from all genes together**, and use it to stabilize each gene's estimate:
+
+$$
+\tilde{s}_g^2 = \frac{d_0 \, s_0^2 + d_g \, s_g^2}{d_0 + d_g}
+$$
+
+- $s_g^2$ with $d_g$ degrees of freedom: the gene's own variance (here $d_g$ = `r fit$df.residual[1]`).
+- $s_0^2$ with $d_0$ "prior" degrees of freedom: the typical variance of all genes, estimated from the data.
+- $\tilde{s}_g^2$: the **moderated** variance, a weighted average that pulls each gene toward the typical value. The **moderated t-statistic** uses $\tilde{s}_g$ instead of $s_g$, with $d_0 + d_g$ degrees of freedom.
+
+```{r ebayes, echo=TRUE}
+# trend = TRUE: the prior variance s0^2 depends on the gene's mean expression (limma-trend).
+# robust = TRUE: genes with extreme variances are not allowed to distort the prior.
+fit2 <- eBayes(fit2, trend = TRUE, robust = TRUE)
+```
+
+```{r plot-sa, fig.width=8, fig.height=5}
+plotSA(fit2, main = "Residual standard deviation vs average expression (red: prior trend)")
+```
+
+<div class="alert-info">
+**How to read it.** Each point is a gene: its average log expression (x) and its residual variability (y, as $\sqrt{s_g}$). The red curve is the **prior** $s_0^2$, which here clearly depends on expression level, the reason for `trend = TRUE`: low-expressed genes are noisier. Points flagged in blue are outliers that `robust = TRUE` keeps from distorting the prior. The estimated prior degrees of freedom are $d_0 \approx$ `r round(median(fit2$df.prior), 1)`. With `r fit$df.residual[1]` residual degrees of freedom per gene, the gene's own variance dominates and the moderation is gentle; it matters most in small experiments, and for the comparisons involving only 6 controls.
+</div>
+
+# Part 6 — Reading the Results
+
+`decideTests()` classifies every gene in every contrast as up, down or not significant, after **Benjamini-Hochberg** correction for multiple testing (false discovery rate 5%). We also require a fold change of at least 2 (`lfc = 1`).
+
+```{r decide, echo=TRUE}
+padj_cutoff   <- 0.05
+log2fc_cutoff <- 1
+
+results_simple <- decideTests(fit2, p.value = padj_cutoff, lfc = log2fc_cutoff)
+```
+
+```{r table-decide}
+kable(as.data.frame.matrix(summary(results_simple)) %>% rownames_to_column("status"),
+      caption = "Genes per contrast (adjusted p < 0.05 and |log2FC| > 1).")
+```
+
+`topTable()` returns the full table of one contrast, ranked by significance:
+
+```{r toptable, echo=TRUE}
+top_tumor <- topTable(fit2, coef = "Tumor_vs_Control", number = Inf, sort.by = "P")
+```
+
+```{r show-toptable}
+datatable(
+  top_tumor %>% rownames_to_column("gene") %>% slice_head(n = 200) %>%
+    mutate(across(c(logFC, AveExpr, t, B), ~ round(.x, 2)), across(c(P.Value, adj.P.Val), ~ signif(.x, 3))),
+  extensions = "Buttons",
+  options = list(dom = "Bfrtip", buttons = c("csv", "excel"), pageLength = 10),
+  rownames = FALSE,
+  caption = "Top 200 genes, Tumor vs Control."
+)
+```
+
+| column | meaning |
+|--------|---------|
+| `logFC` | the contrast's value: log2 fold change |
+| `AveExpr` | mean log2 expression over all samples |
+| `t` | moderated t-statistic |
+| `P.Value`, `adj.P.Val` | raw and Benjamini-Hochberg adjusted p-value |
+| `B` | log-odds that the gene is differentially expressed |
+
+## Which Genes Are Shared? A Venn Diagram
+
+```{r plot-venn, fig.width=7, fig.height=6}
+vennDiagram(results_simple[, c("Favorable_vs_Control", "Unfavorable_vs_Control")],
+            include = c("up", "down"), counts.col = c("#e74c3c", "#2980b9"),
+            names = c("Favorable vs Control", "Unfavorable vs Control"), cex = c(1, 0.9, 0.8))
+```
+
+<div class="alert-info">
+**Most of the tumor signal is shared.** The large overlap (red = up, blue = down in the tumor) shows that what separates a Wilms tumor from normal kidney is largely the same in both histologies: loss of mature kidney genes, gain of the embryonic and proliferative programs.
+</div>
+
+## Mean-Difference and Volcano Plots
+
+```{r plot-md, fig.width=11, fig.height=5}
+par(mfrow = c(1, 2))
+plotMD(fit2, coef = "Tumor_vs_Control", status = results_simple[, "Tumor_vs_Control"],
+       values = c(1, -1), hl.col = c("#e74c3c", "#2980b9"), main = "Tumor vs Control")
+plotMD(fit2, coef = "Unfavorable_vs_Favorable", status = results_simple[, "Unfavorable_vs_Favorable"],
+       values = c(1, -1), hl.col = c("#e74c3c", "#2980b9"), main = "Unfavorable vs Favorable")
+```
+
+```{r volcano-data, echo=TRUE}
+volcano_table <- map_dfr(colnames(contrast_matrix), function(contrast) {
+  topTable(fit2, coef = contrast, number = Inf) %>%
+    rownames_to_column("gene") %>%
+    mutate(contrast = contrast,
+           status = case_when(adj.P.Val < padj_cutoff & logFC >  log2fc_cutoff ~ "Up",
+                              adj.P.Val < padj_cutoff & logFC < -log2fc_cutoff ~ "Down",
+                              TRUE ~ "Not DEG"))
+}) %>%
+  mutate(contrast = factor(contrast, levels = colnames(contrast_matrix)))
+```
+
+```{r plot-volcano, fig.width=11, fig.height=9}
+volcano_labels <- volcano_table %>% filter(status != "Not DEG") %>%
+  group_by(contrast) %>% slice_min(adj.P.Val, n = 8, with_ties = FALSE) %>% ungroup()
+
+volcano_table %>%
+  ggplot(aes(x = logFC, y = -log10(adj.P.Val), color = status)) +
+  geom_point(size = 0.6, alpha = 0.5) +
+  geom_vline(xintercept = c(-log2fc_cutoff, log2fc_cutoff), linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = -log10(padj_cutoff), linetype = "dashed", color = "grey40") +
+  geom_text_repel(data = volcano_labels, aes(label = gene), size = 2.8, color = "black", max.overlaps = Inf) +
+  scale_color_manual(values = c(Up = "#e74c3c", Down = "#2980b9", `Not DEG` = "grey75")) +
+  facet_wrap(~ contrast, scales = "free") +
+  labs(x = "log2 fold change", y = "-log10(adjusted p-value)", color = NULL) +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+## A Biological Sanity Check
+
+```{r markers}
+marker_genes <- c(SIX1 = "nephron progenitor: up", SIX2 = "nephron progenitor: up", CITED1 = "nephron progenitor: up",
+                  LIN28B = "embryonic: up", IGF2 = "11p15.5 imprinted: up",
+                  UMOD = "mature tubule: down", AQP2 = "mature tubule: down", SLC22A2 = "mature tubule: down")
+
+kable(
+  topTable(fit2, coef = "Tumor_vs_Control", number = Inf)[names(marker_genes), c("logFC", "adj.P.Val")] %>%
+    rownames_to_column("gene") %>%
+    mutate(expected = marker_genes[gene], logFC = round(logFC, 2), adj.P.Val = signif(adj.P.Val, 3)),
+  caption = "Known Wilms tumor biology, Tumor vs Control."
+)
+```
+
+Embryonic kidney genes up and mature tubule genes down: the model measures real biology.
+
+# Part 7 — Testing a Fold-Change Threshold Properly: `treat()`
+
+Above, we called a gene a DEG if its adjusted p-value was below 0.05 **and** its estimated |log2FC| exceeded 1. This is very common, but the p-value tests "log2FC = 0", not "|log2FC| ≤ 1". A gene whose true change is 1.5-fold, estimated at 2.1-fold by chance, passes both filters.
+
+`treat()` tests the right hypothesis directly: **is |log2FC| significantly greater than the threshold?**
+
+```{r treat, echo=TRUE}
+fit_treat <- treat(contrasts.fit(fit, contrast_matrix), lfc = log2fc_cutoff, trend = TRUE, robust = TRUE)
+results_treat <- decideTests(fit_treat, p.value = padj_cutoff)
+```
+
+```{r table-treat}
+compare_counts <- function(res, label) {
+  as.data.frame.matrix(summary(res)) %>% rownames_to_column("status") %>%
+    filter(status != "NotSig") %>% mutate(method = label, .before = 1)
+}
+kable(bind_rows(compare_counts(results_simple, "p-value + |log2FC| filter"),
+                compare_counts(results_treat, "treat(lfc = 1)")),
+      caption = "DEGs per contrast with the two approaches.")
+```
+
+<div class="alert-info">
+**treat is stricter, and honest.** It keeps only genes for which the data show a change *larger* than two-fold with confidence, so the lists are much shorter. Use the post-hoc filter for exploration; use `treat()` when the fold change itself is part of the claim ("more than two-fold up in the tumor"). Note that `treat()` with `lfc = 1` finds nothing between the two histologies: no gene differs by more than two-fold with confidence.
+</div>
+
+# Part 8 — Paired Samples: `duplicateCorrelation()`
+
+Six normal kidneys come from patients whose tumor is also in the dataset. Two samples of the same child share genetic background and handling, so they are **correlated**, and the model above treats them as independent. limma handles this with a **random block effect**: `duplicateCorrelation()` estimates how correlated the samples of the same patient are, and `lmFit()` uses that correlation.
+
+```{r duplicate-correlation, echo=TRUE}
+# Takes about a minute: the correlation is estimated gene by gene, then summarized.
+dup_cor <- duplicateCorrelation(log_expr, design, block = samples$patient)
+dup_cor$consensus.correlation
+```
+
+```{r fit-blocked, echo=TRUE}
+fit_blocked <- lmFit(log_expr, design, block = samples$patient, correlation = dup_cor$consensus.correlation)
+fit_blocked <- eBayes(contrasts.fit(fit_blocked, contrast_matrix), trend = TRUE, robust = TRUE)
+results_blocked <- decideTests(fit_blocked, p.value = padj_cutoff, lfc = log2fc_cutoff)
+```
+
+```{r table-blocked}
+kable(bind_rows(compare_counts(results_simple, "independent samples"),
+                compare_counts(results_blocked, "patient as block")),
+      caption = "DEGs per contrast, with and without accounting for the paired patients.")
+```
+
+<div class="alert-info">
+**Why a block and not a patient coefficient?** Only 6 of 124 patients have two samples, so a fixed coefficient per patient would waste most degrees of freedom on singletons. A **block** says "samples of the same patient are correlated by ρ" and estimates a single ρ (here `r round(dup_cor$consensus.correlation, 2)`) from all genes. The results change little, because only 6 pairs are involved, but the model now describes how the samples were actually collected, so we keep it as the final model.
+</div>
+
+```{r export, echo=TRUE}
+dir.create("results", showWarnings = FALSE)
+for (contrast in colnames(contrast_matrix)) {
+  topTable(fit_blocked, coef = contrast, number = Inf, sort.by = "P") %>%
+    rownames_to_column("gene") %>%
+    write_csv(file.path("results", paste0("limma_", contrast, ".csv")))
+}
+list.files("results")
+```
+
+# Part 9 — Unfavorable vs Favorable Histology
+
+The comparison with the most clinical interest involves no controls at all: 42 anaplastic vs 82 favorable tumors.
+
+```{r unf-vs-fav, echo=TRUE}
+top_histology <- topTable(fit_blocked, coef = "Unfavorable_vs_Favorable", number = Inf, sort.by = "P")
+```
+
+```{r table-unf-vs-fav}
+datatable(
+  top_histology %>% rownames_to_column("gene") %>% filter(adj.P.Val < padj_cutoff) %>%
+    mutate(across(c(logFC, AveExpr, t, B), ~ round(.x, 2)), across(c(P.Value, adj.P.Val), ~ signif(.x, 3))),
+  extensions = "Buttons",
+  options = list(dom = "Bfrtip", buttons = c("csv", "excel"), pageLength = 10),
+  rownames = FALSE,
+  caption = "Genes with adjusted p < 0.05, Unfavorable vs Favorable (no fold-change filter)."
+)
+```
+
+`r sum(top_histology$adj.P.Val < padj_cutoff)` genes reach adjusted p < 0.05, but only `r sum(top_histology$adj.P.Val < padj_cutoff & abs(top_histology$logFC) > log2fc_cutoff)` of them change more than two-fold: the two histologies differ in **many small shifts** rather than a few large ones. Module 3 shows that those small shifts add up to coherent biological programs.
+
+## The p53 Axis
+
+One gene stands out: **TP53** itself is lower in anaplastic tumors, and so are two of its classic transcriptional targets, **CDKN1A** (p21, the cell-cycle brake p53 switches on) and **MDM2** (the p53 negative feedback regulator).
+
+```{r plot-p53, fig.width=11, fig.height=4.5}
+p53_genes <- c("TP53", "CDKN1A", "MDM2")
+
+as_tibble(t(log_expr[p53_genes, ]), rownames = "sample_id") %>%
+  left_join(samples, by = "sample_id") %>%
+  pivot_longer(all_of(p53_genes), names_to = "gene", values_to = "log_expr") %>%
+  mutate(gene = factor(gene, levels = p53_genes)) %>%
+  ggplot(aes(x = group, y = log_expr, fill = group)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.15, size = 0.8, alpha = 0.5) +
+  scale_fill_manual(values = group_colors) +
+  facet_wrap(~ gene, scales = "free_y") +
+  labs(x = NULL, y = "log2(TPM + 1)") +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+```{r table-p53}
+kable(top_histology[p53_genes, c("logFC", "adj.P.Val")] %>% rownames_to_column("gene") %>%
+        mutate(logFC = round(logFC, 2), adj.P.Val = signif(adj.P.Val, 3)),
+      caption = "The p53 axis, Unfavorable vs Favorable.")
+```
+
+<div class="alert-info">
+**Connecting expression to mutation.** Anaplastic Wilms tumors very frequently carry **TP53 mutations** (the Exome sequencing tutorial finds them in most Unfavorable tumors and in none of the Favorable ones). Many TP53 mutations are truncating, and the mutant mRNA is then degraded (*nonsense-mediated decay*), or the second allele is lost: both lower TP53 expression. A p53 protein that no longer works also stops switching on its targets, which is why **CDKN1A** and **MDM2** fall too. Two independent data types tell the same story.
+</div>
+
+```{r heatmap-histology, fig.width=10, fig.height=7}
+top_hist_genes <- top_histology %>% rownames_to_column("gene") %>% slice_min(adj.P.Val, n = 30) %>% pull(gene)
+tumors <- samples$group != "Control"
+
+pheatmap(
+  log_expr[top_hist_genes, tumors],
+  scale = "row",
+  color = colorRampPalette(c("#2980b9", "white", "#e74c3c"))(100),
+  breaks = seq(-3, 3, length.out = 101),
+  clustering_distance_cols = "correlation", clustering_method = "average",
+  annotation_col = data.frame(Histology = droplevels(samples$group[tumors]), row.names = samples$sample_id[tumors]),
+  annotation_colors = list(Histology = group_colors[c("Favorable", "Unfavorable")]),
+  show_colnames = FALSE, fontsize_row = 7, border_color = NA, treeheight_row = 15,
+  main = "Top 30 genes, Unfavorable vs Favorable (row z-score, tumors only)"
+)
+```
+
+<div class="alert-info">
+**No clean split.** Even the top genes separate the two histologies only partially: many Unfavorable tumors look like Favorable ones and vice versa. Histology is a clinical classification of the *worst* area of a tumor (anaplasia can be focal), while bulk RNA-seq averages the whole sample. This is a good reminder that a statistically significant difference between group means is not the same as a gene that **classifies** individual patients.
+</div>
+
+# Summary
+
+- limma fits **one linear model per gene**; the **design matrix** describes the samples and **contrasts** state the questions.
+- **Empirical Bayes** (`eBayes`, with `trend = TRUE` for TPM) stabilizes the variance of every gene by borrowing information across genes.
+- `decideTests()` and `topTable()` give the results; **`treat()`** tests a fold-change threshold properly.
+- **`duplicateCorrelation()`** accounts for samples from the same patient.
+- Tumor vs normal kidney changes thousands of genes; Unfavorable vs Favorable changes few genes by much, with **TP53 and its targets** among the clearest.
+- Full tables are saved in `results/` for Module 3.
+
+---
+
+<div class="report-footer">
+Generated on `r format(Sys.Date(), '%d %B %Y')` · Francesco Cecere (Senior Bioinformatic Researcher) · AORN Santobono-Pausilipon IRCCS
+</div>
