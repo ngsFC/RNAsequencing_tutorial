@@ -174,12 +174,12 @@ library(knitr)       # kable for simple inline tables
 
 # From Module 2
 
-Module 2 found thousands of genes changed between tumor and normal kidney, and only a few genes changed strongly between Unfavorable and Favorable tumors. A list of single genes is hard to interpret either way. This module asks a different question: **do the genes of a known biological program move together?** Many small, coordinated shifts in one pathway can be more meaningful than one large change in a single gene.
+Module 2 found thousands of genes changed between the tumors and the normal kidneys of the same children. A list that long cannot be read gene by gene. This module asks a different question: **do the genes of a known biological program move together?**
 
-**Plan:** gene sets → two kinds of test → `camera` (limma) → GSEA (`fgsea`) → do the methods agree? → GO terms behind the histology difference.
+**Plan:** gene sets → two kinds of test → `camera` (limma) → GSEA (`fgsea`) → do the methods agree? → GO terms with redundancy collapsed.
 
 ```{r load-data, echo=TRUE}
-# Same matrix, sample sheet and design as Module 2.
+# Same matrix, sample sheet and paired design as Module 2.
 tumor_tpm   <- read_csv("data/TARGET_WT_gene_expression_tpm.csv", show_col_types = FALSE)
 control_tpm <- read_csv("data/TARGET_WT_control_gene_expression_tpm.csv", show_col_types = FALSE)
 tumor_metadata   <- read_csv("data/sample_metadata.csv", show_col_types = FALSE)
@@ -188,41 +188,25 @@ control_metadata <- read_csv("data/TARGET_WT_control_clinical_raw.csv", show_col
 tpm <- as.matrix(bind_cols(tumor_tpm[, -1], control_tpm[, -1]))
 rownames(tpm) <- tumor_tpm$gene_name
 samples <- bind_rows(
-  tumor_metadata %>% transmute(sample_id = case_submitter_id, group = histologic_subtype),
-  control_metadata %>% transmute(sample_id = sample_submitter_id, group = "Control")
+  tumor_metadata %>% transmute(sample_id = case_submitter_id, patient = case_submitter_id, condition = "Tumor"),
+  control_metadata %>% transmute(sample_id = sample_submitter_id, patient = case_submitter_id, condition = "Normal")
 ) %>%
-  mutate(group = factor(group, levels = c("Control", "Favorable", "Unfavorable")))
+  mutate(condition = factor(condition, levels = c("Normal", "Tumor")), patient = factor(patient))
 samples <- samples[match(colnames(tpm), samples$sample_id), ]
 stopifnot(identical(samples$sample_id, colnames(tpm)))
 
-log_expr <- log2(tpm[rowSums(tpm >= 1) >= min(table(samples$group)), ] + 1)
+log_expr <- log2(tpm[rowSums(tpm >= 1) >= min(table(samples$condition)), ] + 1)
+design_paired <- model.matrix(~ patient + condition, data = samples)
 
-design <- model.matrix(~ 0 + group, data = samples)
-colnames(design) <- levels(samples$group)
-contrast_matrix <- makeContrasts(
-  Tumor_vs_Control         = (Favorable + Unfavorable) / 2 - Control,
-  Unfavorable_vs_Favorable = Unfavorable - Favorable,
-  levels = design
-)
-
-# Module 2's results (patient-blocked model), one table per contrast.
-limma_results <- map(set_names(colnames(contrast_matrix)),
-                     ~ read_csv(file.path("results", paste0("limma_", .x, ".csv")), show_col_types = FALSE))
-```
-
-```{r reorder-helper, include=FALSE}
-# Order labels within each facet (the same set can appear in both facets).
-reorder_within <- function(x, by, within) {
-  key <- paste(x, within, sep = "___")
-  factor(key, levels = unique(key[order(by)]))
-}
+# Module 2's paired results.
+limma_results <- read_csv("results/limma_tumor_vs_normal_paired.csv", show_col_types = FALSE)
 ```
 
 # Part 1 — Gene Sets
 
 A **gene set** is a list of genes sharing a function. We use two collections from **MSigDB**, saved in `data/` by `data-prep/build_gene_sets.R`:
 
-- **Hallmark** (50 sets): compact, curated, non-redundant summaries of well-defined biological states, e.g. `HALLMARK_E2F_TARGETS` (cell-cycle genes switched on by E2F) or `HALLMARK_P53_PATHWAY`. The best starting point.
+- **Hallmark** (50 sets): compact, curated, non-redundant summaries of well-defined biological states, e.g. `HALLMARK_E2F_TARGETS` (cell-cycle genes switched on by E2F) or `HALLMARK_OXIDATIVE_PHOSPHORYLATION`. The best starting point.
 - **GO Biological Process** (thousands of sets): detailed and hierarchical, but highly redundant.
 
 ```{r gene-sets, echo=TRUE}
@@ -231,6 +215,8 @@ go_bp    <- gmtPathways("data/msigdb_go_bp.gmt")
 
 min_size <- 15
 max_size <- 500
+
+pretty_name <- function(x) str_replace_all(str_remove(x, "^(HALLMARK|GOBP)_"), "_", " ")
 ```
 
 # Part 2 — Two Questions You Can Ask of a Gene Set
@@ -244,7 +230,7 @@ max_size <- 500
 We use **competitive** tests: they tell us which programs stand out *relative to* the general change.
 
 <div class="alert-info">
-**The hidden problem: genes are correlated.** Genes of one pathway tend to go up and down together across samples. Many gene set tests treat them as independent, which makes them far too confident (p-values much too small). **camera** (*Correlation Adjusted MEan RAnk*) estimates the average correlation between the genes of each set and corrects the test for it. It is limma's recommended competitive test and works directly on the expression matrix, design and contrast.
+**The hidden problem: genes are correlated.** Genes of one pathway tend to go up and down together across samples. Many gene set tests treat them as independent, which makes them far too confident (p-values much too small). **camera** (*Correlation Adjusted MEan RAnk*) estimates the average correlation between the genes of each set and corrects the test for it. It is limma's recommended competitive test and works directly on the expression matrix and the design, here the paired one.
 </div>
 
 # Part 3 — camera
@@ -252,36 +238,30 @@ We use **competitive** tests: they tell us which programs stand out *relative to
 ```{r camera, echo=TRUE}
 hallmark_index <- ids2indices(hallmark, rownames(log_expr))
 
-camera_results <- map_dfr(colnames(contrast_matrix), function(contrast) {
-  camera(log_expr, index = hallmark_index, design = design, contrast = contrast_matrix[, contrast]) %>%
-    rownames_to_column("pathway") %>%
-    mutate(contrast = contrast)
-})
+# contrast = the coefficient to test, by name: the tumor effect of the paired design.
+camera_results <- camera(log_expr, index = hallmark_index, design = design_paired, contrast = "conditionTumor") %>%
+  rownames_to_column("pathway") %>%
+  as_tibble()
 ```
 
 ```{r table-camera-summary}
-kable(camera_results %>% group_by(contrast) %>%
-        summarise(sets_tested = n(), `FDR < 0.05, up` = sum(FDR < 0.05 & Direction == "Up"),
-                  `FDR < 0.05, down` = sum(FDR < 0.05 & Direction == "Down")),
+kable(tibble(sets_tested = nrow(camera_results),
+             `FDR < 0.05, up in tumor` = sum(camera_results$FDR < 0.05 & camera_results$Direction == "Up"),
+             `FDR < 0.05, down in tumor` = sum(camera_results$FDR < 0.05 & camera_results$Direction == "Down")),
       caption = "camera on the 50 Hallmark sets.")
 ```
 
-```{r plot-camera, fig.width=12, fig.height=7}
+```{r plot-camera, fig.width=10, fig.height=8}
 camera_results %>%
   filter(FDR < 0.05) %>%
-  group_by(contrast) %>%
-  slice_min(FDR, n = 15, with_ties = FALSE) %>%
-  ungroup() %>%
+  slice_min(FDR, n = 25, with_ties = FALSE) %>%
   mutate(score = -log10(FDR) * if_else(Direction == "Up", 1, -1),
-         label = str_replace_all(str_remove(pathway, "^HALLMARK_"), "_", " "),
-         label = reorder_within(label, score, contrast)) %>%
+         label = fct_reorder(pretty_name(pathway), score)) %>%
   ggplot(aes(x = score, y = label, fill = Direction)) +
   geom_col() +
-  scale_y_discrete(labels = function(x) str_remove(x, "___.*$")) +
-  scale_fill_manual(values = c(Up = "#e74c3c", Down = "#2980b9")) +
-  facet_wrap(~ contrast, scales = "free_y") +
-  labs(x = "signed -log10(FDR)  (right: up, left: down)", y = NULL, fill = NULL,
-       title = "camera: significant Hallmark sets (top 15 per contrast)") +
+  scale_fill_manual(values = c(Up = "#e74c3c", Down = "#2980b9"), labels = c(Up = "Up in tumor", Down = "Down in tumor")) +
+  labs(x = "signed -log10(FDR)  (right: up in tumor, left: down)", y = NULL, fill = NULL,
+       title = "camera: the 25 most significant Hallmark sets") +
   theme_bw(base_size = 11) +
   theme(legend.position = "bottom")
 ```
@@ -291,84 +271,78 @@ camera_results %>%
 **GSEA** ranks all genes from most up to most down and asks whether a set's genes concentrate at one end of the list. We rank by the **moderated t-statistic** of Module 2 (it combines fold change and precision, and carries the direction).
 
 ```{r fgsea, echo=TRUE}
-run_fgsea <- function(results, gene_sets) {
-  ranks <- results %>% arrange(desc(t)) %>% pull(t, name = gene)
+ranks <- limma_results %>% arrange(desc(t)) %>% pull(t, name = gene)
+
+run_fgsea <- function(gene_sets) {
   set.seed(20261105)
   fgsea(pathways = gene_sets, stats = ranks, minSize = min_size, maxSize = max_size, eps = 0) %>%
     as_tibble() %>% arrange(padj)
 }
 
-gsea_hallmark <- map_dfr(limma_results, run_fgsea, gene_sets = hallmark, .id = "contrast")
+gsea_hallmark <- run_fgsea(hallmark)
 ```
 
-```{r plot-gsea, fig.width=12, fig.height=7}
+```{r plot-gsea, fig.width=10, fig.height=8}
 gsea_hallmark %>%
   filter(padj < 0.05) %>%
-  group_by(contrast) %>%
-  slice_max(abs(NES), n = 15, with_ties = FALSE) %>%
-  ungroup() %>%
-  mutate(label = str_replace_all(str_remove(pathway, "^HALLMARK_"), "_", " "),
-         label = reorder_within(label, NES, contrast),
-         direction = if_else(NES > 0, "Up", "Down")) %>%
+  slice_max(abs(NES), n = 25, with_ties = FALSE) %>%
+  mutate(label = fct_reorder(pretty_name(pathway), NES),
+         direction = if_else(NES > 0, "Up in tumor", "Down in tumor")) %>%
   ggplot(aes(x = NES, y = label, fill = direction)) +
   geom_col() +
-  scale_y_discrete(labels = function(x) str_remove(x, "___.*$")) +
-  scale_fill_manual(values = c(Up = "#e74c3c", Down = "#2980b9")) +
-  facet_wrap(~ contrast, scales = "free_y") +
+  scale_fill_manual(values = c(`Up in tumor` = "#e74c3c", `Down in tumor` = "#2980b9")) +
   labs(x = "Normalized enrichment score (NES)", y = NULL, fill = NULL,
-       title = "fgsea: strongest significant Hallmark sets (top 15 per contrast)") +
+       title = "fgsea: the 25 strongest significant Hallmark sets") +
   theme_bw(base_size = 11) +
   theme(legend.position = "bottom")
 ```
 
-The classic GSEA plot for the strongest set **up in Unfavorable** tumors: the green curve is the running enrichment score, each tick one gene of the set at its rank (left = most up in Unfavorable).
+The classic GSEA plot for the strongest set in each direction: the green curve is the running enrichment score, each tick one gene of the set at its rank (left = most up in the tumor). The **leading edge** is the part of the list before the peak: the genes that drive the enrichment.
 
 ```{r plot-enrichment, fig.width=9, fig.height=4}
-ranks_histology <- limma_results$Unfavorable_vs_Favorable %>% arrange(desc(t)) %>% pull(t, name = gene)
-top_unf_set <- gsea_hallmark %>% filter(contrast == "Unfavorable_vs_Favorable", NES > 0) %>%
-  slice_min(padj, n = 1, with_ties = FALSE) %>% pull(pathway)
+top_up_set   <- gsea_hallmark %>% filter(NES > 0) %>% slice_min(padj, n = 1, with_ties = FALSE) %>% pull(pathway)
+top_down_set <- gsea_hallmark %>% filter(NES < 0) %>% slice_min(padj, n = 1, with_ties = FALSE) %>% pull(pathway)
 
-plotEnrichment(hallmark[[top_unf_set]], ranks_histology) +
-  labs(title = top_unf_set, x = "Gene rank (up in Unfavorable → up in Favorable)", y = "Running enrichment score")
+for (set in c(top_up_set, top_down_set)) {
+  print(plotEnrichment(hallmark[[set]], ranks) +
+          labs(title = set, x = "Gene rank (up in tumor → down in tumor)", y = "Running enrichment score"))
+}
 ```
 
 # Part 5 — Do camera and GSEA Agree?
 
 ```{r agreement, echo=TRUE}
 agreement <- camera_results %>%
-  transmute(contrast, pathway, camera_score = -log10(PValue) * if_else(Direction == "Up", 1, -1)) %>%
-  inner_join(gsea_hallmark %>% select(contrast, pathway, NES), by = c("contrast", "pathway"))
+  transmute(pathway, camera_score = -log10(PValue) * if_else(Direction == "Up", 1, -1)) %>%
+  inner_join(gsea_hallmark %>% select(pathway, NES), by = "pathway")
+agreement_r <- round(cor(agreement$NES, agreement$camera_score), 2)
 ```
 
-```{r plot-agreement, fig.width=11, fig.height=5}
+```{r plot-agreement, fig.width=7, fig.height=5.5}
 agreement %>%
   ggplot(aes(x = NES, y = camera_score)) +
   geom_hline(yintercept = 0, color = "grey70") +
   geom_vline(xintercept = 0, color = "grey70") +
   geom_point(color = "#8e44ad", size = 2, alpha = 0.8) +
-  facet_wrap(~ contrast, scales = "free") +
   labs(x = "fgsea NES", y = "camera signed -log10(p)",
-       title = paste0("Each point is a Hallmark set; correlation per contrast: ",
-                      paste(agreement %>% group_by(contrast) %>%
-                              summarise(r = round(cor(NES, camera_score), 2)) %>%
-                              transmute(txt = paste0(contrast, " r = ", r)) %>% pull(txt), collapse = ", "))) +
-  theme_bw(base_size = 11)
+       title = paste0("Each point is a Hallmark set (correlation r = ", agreement_r, ")")) +
+  theme_bw(base_size = 12)
 ```
 
 <div class="alert-info">
-**Broad agreement, different confidence.** Both methods rank the sets similarly (same direction, same top sets). camera is usually more conservative, because it accounts for the correlation between genes; GSEA's permutations of *genes* (as in fgsea) do not. When a set is significant by both, the result is robust.
+**Broad agreement, different confidence.** Both methods rank the sets similarly (r = `r agreement_r`): same direction, same top sets. camera is usually more conservative, because it accounts for the correlation between genes; GSEA's permutations of *genes* (as in fgsea) do not. When a set is significant by both, the result is robust.
 </div>
 
-# Part 6 — What Distinguishes Anaplastic Tumors? GO Biological Process
+# Part 6 — GO Biological Process: Collapsing Redundancy
 
 GO terms give more specific labels, at the cost of heavy redundancy ("cell cycle", "mitotic cell cycle", "cell cycle process"...). `collapsePathways()` keeps only the **independent** signals among the top terms.
 
-```{r go-histology, echo=TRUE}
-gsea_go <- run_fgsea(limma_results$Unfavorable_vs_Favorable, go_bp)
+```{r go, echo=TRUE}
+gsea_go <- run_fgsea(go_bp)
 
 top_go    <- gsea_go %>% filter(padj < 0.05) %>% slice_min(padj, n = 100, with_ties = FALSE)
 # collapsePathways() works on fgsea's own data.table output, not on a tibble.
-collapsed <- collapsePathways(data.table::as.data.table(top_go), pathways = go_bp, stats = ranks_histology)
+collapsed <- collapsePathways(data.table::as.data.table(top_go), pathways = go_bp, stats = ranks)
 main_go   <- top_go %>% filter(pathway %in% collapsed$mainPathways)
 ```
 
@@ -377,15 +351,13 @@ main_go %>%
   group_by(NES > 0) %>%
   slice_min(padj, n = 12, with_ties = FALSE) %>%
   ungroup() %>%
-  mutate(label = str_trunc(str_replace_all(str_remove(pathway, "^GOBP_"), "_", " "), 60),
-         label = fct_reorder(label, NES),
-         direction = if_else(NES > 0, "Up in Unfavorable", "Up in Favorable")) %>%
+  mutate(label = fct_reorder(str_trunc(pretty_name(pathway), 60), NES),
+         direction = if_else(NES > 0, "Up in tumor", "Down in tumor")) %>%
   ggplot(aes(x = NES, y = label, fill = direction)) +
   geom_col() +
-  scale_fill_manual(values = c(`Up in Unfavorable` = "#e74c3c", `Up in Favorable` = "#2980b9")) +
+  scale_fill_manual(values = c(`Up in tumor` = "#e74c3c", `Down in tumor` = "#2980b9")) +
   labs(x = "NES", y = NULL, fill = NULL,
-       title = paste0("Unfavorable vs Favorable: main independent GO BP terms (", nrow(main_go),
-                      " of the top ", nrow(top_go), " after collapsing)")) +
+       title = paste0("Main independent GO BP terms (", nrow(main_go), " of the top ", nrow(top_go), " after collapsing)")) +
   theme_bw(base_size = 11) +
   theme(legend.position = "bottom")
 ```
@@ -393,42 +365,39 @@ main_go %>%
 ```{r table-results}
 datatable(
   bind_rows(
-    camera_results %>% transmute(method = "camera", contrast, pathway, direction = Direction, FDR = signif(FDR, 3), NES = NA_real_),
-    gsea_hallmark %>% transmute(method = "fgsea", contrast, pathway, direction = if_else(NES > 0, "Up", "Down"),
-                                FDR = signif(padj, 3), NES = round(NES, 2))
-  ) %>% filter(FDR < 0.05) %>% arrange(contrast, method, FDR),
+    camera_results %>% transmute(method = "camera", collection = "Hallmark", pathway, direction = Direction,
+                                 FDR = signif(FDR, 3), NES = NA_real_),
+    gsea_hallmark %>% transmute(method = "fgsea", collection = "Hallmark", pathway,
+                                direction = if_else(NES > 0, "Up", "Down"), FDR = signif(padj, 3), NES = round(NES, 2)),
+    main_go %>% transmute(method = "fgsea", collection = "GO BP (main terms)", pathway,
+                          direction = if_else(NES > 0, "Up", "Down"), FDR = signif(padj, 3), NES = round(NES, 2))
+  ) %>% filter(FDR < 0.05) %>% arrange(collection, method, FDR),
   extensions = "Buttons",
   options = list(dom = "Bfrtip", buttons = c("csv", "excel"), pageLength = 10, scrollX = TRUE),
   rownames = FALSE,
-  caption = "Every significant Hallmark result (FDR < 0.05), both methods."
+  caption = "Every significant result (FDR < 0.05)."
 )
 ```
 
 ```{r export, echo=TRUE}
 write_csv(camera_results, "results/camera_hallmark.csv")
-bind_rows(gsea_hallmark %>% mutate(collection = "Hallmark"),
-          gsea_go %>% mutate(contrast = "Unfavorable_vs_Favorable", collection = "GO BP")) %>%
+bind_rows(Hallmark = gsea_hallmark, `GO BP` = gsea_go, .id = "collection") %>%
   mutate(leadingEdge = map_chr(leadingEdge, ~ paste(.x, collapse = ";"))) %>%
   write_csv("results/fgsea_results.csv")
 ```
 
 # Part 7 — Reading the Results With Care
 
-```{r p53-set}
-p53_set <- gsea_hallmark %>% filter(contrast == "Unfavorable_vs_Favorable", pathway == "HALLMARK_P53_PATHWAY")
-```
-
-- **Tumor vs Control** is dominated by **cell proliferation** (E2F targets, G2M checkpoint, MYC targets) going up, and by programs of the **mature kidney and its surroundings** going down. Many "down" sets describe **which cells are missing** from a tumor sample (mature tubule cells, resident immune and stromal cells) rather than a pathway switched off inside tumor cells.
-- **Unfavorable vs Favorable** shows coordinated differences even though few single genes pass a two-fold threshold: this is exactly the situation where gene set analysis adds the most.
-- **The p53 program is down in anaplastic tumors.** `HALLMARK_P53_PATHWAY` (the genes p53 switches on) has NES = `r round(p53_set$NES, 2)` (adjusted p = `r signif(p53_set$padj, 2)`) in Unfavorable vs Favorable: the pathway-level counterpart of the lower *TP53*, *CDKN1A* and *MDM2* expression seen in Module 2, and of the TP53 mutations found in the Exome sequencing tutorial. Proliferation (`E2F_TARGETS`, `MYC_TARGETS`) and energy metabolism (`OXIDATIVE_PHOSPHORYLATION`, `MTORC1_SIGNALING`) go the other way, up in Unfavorable tumors.
+- **Up in tumor: proliferation.** Cell-cycle programs (`E2F_TARGETS`, `G2M_CHECKPOINT`, `MYC_TARGETS`) dominate: Wilms tumor is made of dividing embryonic-like cells, while mature kidney cells rarely divide.
+- **Down in tumor: what the tumor lacks.** Immune and inflammatory programs (`INTERFERON_GAMMA_RESPONSE`, `TNFA_SIGNALING_VIA_NFKB`, `INFLAMMATORY_RESPONSE`), coagulation and mature metabolic functions describe **which cells are missing** from a tumor sample (resident immune and stromal cells, mature tubule cells) rather than a pathway switched off inside tumor cells. Bulk RNA-seq always mixes cell types.
 - **Competitive tests depend on the background.** "Up" means "more up than the typical gene in this comparison".
 - **An enriched set is a hypothesis.** It tells us that the genes of a program move together, not why. The leading-edge genes (in `results/fgsea_results.csv`) are where to look next.
 
 # Summary
 
-- **camera** (limma) is a competitive test that corrects for **inter-gene correlation**, working directly on expression, design and contrast.
+- **camera** (limma) is a competitive test that corrects for **inter-gene correlation**, working directly on expression and the paired design.
 - **GSEA** (fgsea) ranks all genes by the moderated t-statistic and needs no cutoff.
-- Using both, and **collapsing** redundant GO terms, gives a robust, readable picture of the biology behind the DEG lists.
+- Using both, and **collapsing** redundant GO terms, gives a robust, readable picture of the biology behind the DEG list.
 
 ---
 

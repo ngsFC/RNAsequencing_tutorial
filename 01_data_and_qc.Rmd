@@ -1,6 +1,6 @@
 ---
 title: "Module 1 — Data and Quality Control"
-subtitle: "RNA-seq Tutorial: TARGET Wilms Tumor Expression, From TPM to a Trusted Matrix"
+subtitle: "RNA-seq Tutorial: Six Wilms Tumors and Their Normal Kidneys, From TPM to a Trusted Matrix"
 author:
   - "**Francesco Cecere** · *Senior Bioinformatic Researcher* · AORN Santobono-Pausilipon IRCCS"
 date: "`r format(Sys.Date(), '%d %B %Y')`"
@@ -179,24 +179,24 @@ This tutorial walks through a complete **bulk RNA-seq** analysis on a real pedia
 | Module | Question |
 |--------|----------|
 | **1 — Data and quality control** (this one) | What is in the expression matrix, and do the samples look the way we expect? |
-| **2 — Differential expression with limma** | Which genes change between tumor and normal kidney, and between the two tumor histologies? |
+| **2 — Differential expression with limma** | Which genes change between each child's tumor and their own normal kidney? |
 | **3 — Gene set analysis** | Which biological programs do those changes point to? |
 
 # Part 1 — The Dataset
 
-The data come from **TARGET-WT**, the Wilms tumor project of the NCI's **TARGET** program (the pediatric counterpart of the adult-focused TCGA), downloaded from the **GDC Data Portal**. Tumors come from children enrolled in the Children's Oncology Group NWTS-5 trial.
+The data come from **TARGET-WT**, the Wilms tumor project of the NCI's **TARGET** program (the pediatric counterpart of the adult-focused TCGA), downloaded from the **GDC Data Portal**. TARGET-WT has RNA-seq for 124 tumors, but only **6 normal kidney** samples. We keep exactly those 6 children, each with **two samples: the tumor and the normal kidney next to it**.
 
-All files are in `data/`, built by `data-prep/build_target_wt_data.R`:
+All files are in `data/`, built by `data-prep/build_target_wt_data.R` and `data-prep/build_paired_subset.R`:
 
 | File | What it is |
 |------|------------|
-| `TARGET_WT_gene_expression_tpm.csv` | 19,938 protein-coding genes × **124 tumors**, in TPM |
-| `TARGET_WT_control_gene_expression_tpm.csv` | the same genes × **6 normal kidney** samples ("Solid Tissue Normal"): all that exist for this project |
-| `sample_metadata.csv` | one row per tumor: **histology** (Favorable / Unfavorable), age, sex, vital status |
+| `TARGET_WT_gene_expression_tpm.csv` | 19,938 protein-coding genes × **6 tumors**, in TPM |
+| `TARGET_WT_control_gene_expression_tpm.csv` | the same genes × the **6 normal kidneys** of the same children |
+| `sample_metadata.csv` | one row per tumor: age, sex, vital status |
 | `TARGET_WT_control_clinical_raw.csv` | one row per normal sample, with the patient it comes from |
 
 <div class="alert-info">
-**Two histologies, two prognoses.** Wilms tumors are classified as **Favorable** histology (the large majority, with excellent survival) or **Unfavorable**, i.e. *anaplastic* (large, abnormal nuclei and chaotic mitoses). Anaplasia is the strongest adverse histological factor in Wilms tumor and drives more intensive treatment.
+**Why a paired design?** Comparing a child's tumor with **their own** normal kidney removes everything that differs between children: genetic background, age, sex, how the samples were collected. What is left is the tumor effect. Six pairs is a small experiment, which is exactly the situation where limma's statistics (Module 2) make the biggest difference, and every step runs in seconds.
 </div>
 
 ```{r load-data, echo=TRUE}
@@ -218,7 +218,7 @@ $$
 1. **Divide by gene length**: a long gene collects more reads than a short one at the same expression level.
 2. **Divide by the sample's total and multiply by one million**: removes the difference in sequencing depth between samples.
 
-TPM values are already **normalized** and comparable across samples and genes; summed over all genes, every sample totals exactly one million.
+TPM values are already **normalized** and comparable across samples; summed over all genes, every sample totals exactly one million.
 
 <div class="alert-info">
 **TPM and the choice of method.** Count-based methods (DESeq2, edgeR, limma-*voom*) model the number of **reads**, and their statistics rely on the noise of counting. TPM no longer carries that information: the read counts have been divided by gene length and library size. For TPM, the appropriate approach is to work on **log2(TPM + 1)** with a method designed for continuous, approximately normal data. That is exactly what **limma** was built for (originally for microarrays), and Module 2 uses its **limma-trend** variant.
@@ -226,7 +226,7 @@ TPM values are already **normalized** and comparable across samples and genes; s
 
 # Part 2 — Building One Matrix and One Sample Sheet
 
-Tumors and normals arrive as two files. We combine them into **one matrix** (genes × samples) and **one sample sheet** in the same order.
+Tumors and normals arrive as two files. We combine them into **one matrix** (genes × samples) and **one sample sheet** in the same order. The sample sheet records, for every sample, its **condition** (Normal or Tumor) and its **patient**: the second column is what makes the design paired.
 
 ```{r combine, echo=TRUE}
 # The two matrices must contain the same genes in the same order before being joined.
@@ -237,60 +237,56 @@ rownames(tpm) <- tumor_tpm$gene_name
 
 samples <- bind_rows(
   tumor_metadata %>% transmute(sample_id = case_submitter_id, patient = case_submitter_id,
-                               group = histologic_subtype, sex = sex_at_birth, age_years),
+                               condition = "Tumor", sex = sex_at_birth, age_years),
   control_metadata %>% transmute(sample_id = sample_submitter_id, patient = case_submitter_id,
-                                 group = "Control")
+                                 condition = "Normal")
 ) %>%
-  mutate(group = factor(group, levels = c("Control", "Favorable", "Unfavorable")))
+  group_by(patient) %>%
+  fill(sex, age_years, .direction = "downup") %>%
+  ungroup() %>%
+  mutate(condition = factor(condition, levels = c("Normal", "Tumor")),
+         patient   = factor(patient))
 
 # The sample sheet must follow the matrix columns exactly: limma matches them by position.
 samples <- samples[match(colnames(tpm), samples$sample_id), ]
 stopifnot(identical(samples$sample_id, colnames(tpm)))
+
+# Every patient must have exactly one tumor and one normal sample.
+stopifnot(all(table(samples$patient, samples$condition) == 1))
 ```
 
-```{r table-groups}
-kable(count(samples, group, name = "samples"), caption = "Samples per group.")
-```
-
-```{r table-patients}
-paired <- samples %>% group_by(patient) %>% filter(n() > 1) %>% arrange(patient, group) %>% ungroup()
-kable(paired %>% select(patient, sample_id, group),
-      caption = "Patients contributing two samples: each normal kidney comes from a child whose tumor is also in the dataset.")
+```{r table-samples}
+kable(samples %>% arrange(patient, condition) %>% select(patient, condition, sample_id, sex, age_years),
+      caption = "The 12 samples: 6 children, each with a normal kidney and a tumor sample.")
 ```
 
 <div class="alert-info">
-**The design in one sentence.** 124 tumors (82 Favorable, 42 Unfavorable) and only **6 normal kidneys**, all from Favorable-histology patients who also contribute their tumor. The small control group limits every tumor-vs-normal comparison; the 6 tumor–normal **pairs** are not independent observations, and Module 2 shows how limma accounts for that.
+**Reading the barcodes.** A tumor is named `TARGET-50-PALKCW`, its normal kidney `TARGET-50-PALKCW-11A`: same patient (`PALKCW`), sample type `11` = solid tissue normal. All six children have **Favorable** histology, the large majority of Wilms tumors.
 </div>
 
 # Part 3 — Sanity Checks
 
 ## TPM Totals
 
-Our matrix keeps only **protein-coding** genes, so each sample sums to *somewhat less* than one million: the missing share is the sample's non-coding RNA. The totals should be similar across samples; a sample far off the rest has an unusual RNA composition.
+Our matrix keeps only **protein-coding** genes, so each sample sums to *somewhat less* than one million: the missing share is the sample's non-coding RNA. A sample far off the rest has an unusual RNA composition.
 
-```{r tpm-totals, echo=TRUE}
-tpm_totals <- tibble(sample_id = colnames(tpm), total_tpm = colSums(tpm)) %>%
-  left_join(samples, by = "sample_id")
-```
-
-```{r plot-tpm-totals, fig.height=4.5}
-p_totals <- tpm_totals %>%
-  ggplot(aes(x = group, y = total_tpm / 1e3, color = group, text = sample_id)) +
-  geom_jitter(width = 0.2, height = 0, size = 2.2, alpha = 0.8) +
-  scale_color_manual(values = c(Control = "#7f8c8d", Favorable = "#2980b9", Unfavorable = "#e74c3c")) +
-  labs(x = NULL, y = "Total protein-coding TPM (thousands)") +
-  theme_bw(base_size = 12) +
-  theme(legend.position = "none")
-
-ggplotly(p_totals, tooltip = c("text", "y"))
+```{r plot-tpm-totals, fig.width=8, fig.height=4}
+tibble(sample_id = colnames(tpm), total_tpm = colSums(tpm)) %>%
+  left_join(samples, by = "sample_id") %>%
+  ggplot(aes(x = patient, y = total_tpm / 1e3, fill = condition)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  scale_fill_manual(values = c(Normal = "#7f8c8d", Tumor = "#8e44ad")) +
+  labs(x = NULL, y = "Total protein-coding TPM (thousands)", fill = NULL) +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1), legend.position = "bottom")
 ```
 
 ## Filtering Low-Expressed Genes
 
-Genes that are essentially not expressed carry no information but still count as tests, making the multiple-testing correction harsher for every other gene. We keep a gene if it has **TPM ≥ 1 in at least 6 samples**, the size of the smallest group, so a gene expressed only in normal kidney is still kept.
+Genes that are essentially not expressed carry no information but still count as tests, making the multiple-testing correction harsher for every other gene. We keep a gene if it has **TPM ≥ 1 in at least 6 samples**, the size of one group, so a gene expressed only in normal kidney (or only in tumors) is still kept.
 
 ```{r filter, echo=TRUE}
-min_samples <- min(table(samples$group))
+min_samples <- min(table(samples$condition))
 keep <- rowSums(tpm >= 1) >= min_samples
 
 # log2(TPM + 1): the scale used from here on. The +1 avoids log(0).
@@ -320,26 +316,26 @@ bind_rows(
   theme_bw(base_size = 12)
 ```
 
-```{r plot-boxplots, fig.width=11, fig.height=4.5}
+```{r plot-boxplots, fig.width=10, fig.height=4.5}
 as_tibble(log_expr, rownames = "gene") %>%
   pivot_longer(-gene, names_to = "sample_id", values_to = "log_expr") %>%
   left_join(samples, by = "sample_id") %>%
-  mutate(sample_id = factor(sample_id, levels = samples$sample_id[order(samples$group)])) %>%
-  ggplot(aes(x = sample_id, y = log_expr, fill = group)) +
-  geom_boxplot(outlier.shape = NA, linewidth = 0.2) +
-  scale_fill_manual(values = c(Control = "#7f8c8d", Favorable = "#2980b9", Unfavorable = "#e74c3c")) +
-  labs(x = "Samples", y = "log2(TPM + 1)", fill = NULL) +
+  mutate(label = paste(str_remove(patient, "TARGET-50-"), condition)) %>%
+  ggplot(aes(x = label, y = log_expr, fill = condition)) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_fill_manual(values = c(Normal = "#7f8c8d", Tumor = "#8e44ad")) +
+  labs(x = NULL, y = "log2(TPM + 1)", fill = NULL) +
   theme_bw(base_size = 11) +
-  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), legend.position = "bottom")
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "bottom")
 ```
 
 <div class="alert-info">
-**What to look for.** One box per sample, with medians at roughly the same height: the normalization worked and no sample is grossly different. A sample whose box sits clearly lower or higher than all others would be the first to investigate.
+**What to look for.** One box per sample, with medians at roughly the same height: the normalization worked and no sample is grossly different.
 </div>
 
 # Part 4 — Principal Component Analysis
 
-PCA summarizes thousands of genes into a few axes of variation; each sample becomes a point, and similar samples land close together. We use the **1,000 most variable genes**, centered but not scaled (all genes are already on the same log2 scale).
+PCA summarizes thousands of genes into a few axes of variation; each sample becomes a point, and similar samples land close together. We use the **1,000 most variable genes**, centered but not scaled (all genes are already on the same log2 scale). A line joins the two samples of each child.
 
 ```{r pca, echo=TRUE}
 top_variable <- names(sort(apply(log_expr, 1, var), decreasing = TRUE))[1:1000]
@@ -349,28 +345,20 @@ percent_var <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
 pca_scores  <- as_tibble(pca$x[, 1:4], rownames = "sample_id") %>% left_join(samples, by = "sample_id")
 ```
 
-```{r plot-pca}
-p_pca <- pca_scores %>%
-  ggplot(aes(x = PC1, y = PC2, color = group, text = paste(sample_id, group, sep = " · "))) +
-  geom_point(size = 2.5, alpha = 0.85) +
-  scale_color_manual(values = c(Control = "#7f8c8d", Favorable = "#2980b9", Unfavorable = "#e74c3c")) +
+```{r plot-pca, fig.width=8, fig.height=5.5}
+pca_scores %>%
+  ggplot(aes(x = PC1, y = PC2)) +
+  geom_line(aes(group = patient), color = "grey70") +
+  geom_point(aes(color = condition), size = 3.5) +
+  geom_text(aes(label = str_remove(patient, "TARGET-50-")), size = 3, vjust = -1.2, color = "grey30") +
+  scale_color_manual(values = c(Normal = "#7f8c8d", Tumor = "#8e44ad")) +
   labs(x = paste0("PC1 (", percent_var[1], "%)"), y = paste0("PC2 (", percent_var[2], "%)"), color = NULL,
-       title = "PCA, 1,000 most variable genes") +
-  theme_bw(base_size = 11)
-
-ggplotly(p_pca, tooltip = "text")
-```
-
-```{r plot-scree, fig.width=7, fig.height=3.5}
-tibble(PC = factor(paste0("PC", 1:10), levels = paste0("PC", 1:10)), variance = percent_var[1:10]) %>%
-  ggplot(aes(x = PC, y = variance)) +
-  geom_col(fill = "#8e44ad") +
-  labs(x = NULL, y = "Variance explained (%)") +
-  theme_bw(base_size = 11)
+       title = "PCA, 1,000 most variable genes; lines join each child's two samples") +
+  theme_bw(base_size = 12)
 ```
 
 <div class="alert-info">
-**How to read it.** The 6 normal kidneys separate clearly from the tumors: tumor vs normal is the strongest signal in the data. Favorable and Unfavorable tumors, instead, **overlap**: histology is *not* the main source of variation among tumors, which already tells us that their differences will be subtler. Tumors also spread widely: Wilms tumors mix blastemal, epithelial and stromal components in different proportions, and that composition, more than histology, drives much of the variation.
+**How to read it.** PC1 alone explains **`r percent_var[1]`%** of the variance and separates every tumor from every normal kidney: tumor vs normal is by far the strongest signal. The six normal kidneys sit tightly together (a uniform tissue), while the tumors spread out: Wilms tumors mix blastemal, epithelial and stromal components in different proportions. The lines are roughly parallel: the tumor effect goes in a similar direction in every child.
 </div>
 
 # Part 5 — Sample-Sample Correlation
@@ -381,10 +369,12 @@ For every pair of samples, the **Pearson correlation** of their log expression a
 sample_cor <- cor(log_expr, method = "pearson")
 ```
 
-```{r plot-correlation, fig.width=9, fig.height=8}
-annotation <- data.frame(Group = samples$group, row.names = samples$sample_id)
+```{r plot-correlation, fig.width=8, fig.height=7}
+labels <- paste(str_remove(samples$patient, "TARGET-50-"), samples$condition)
+annotation <- data.frame(Condition = samples$condition, row.names = labels)
 heatmap_cor <- sample_cor
 diag(heatmap_cor) <- NA
+dimnames(heatmap_cor) <- list(labels, labels)
 
 pheatmap(
   heatmap_cor,
@@ -392,43 +382,21 @@ pheatmap(
   clustering_distance_rows = as.dist(1 - sample_cor), clustering_distance_cols = as.dist(1 - sample_cor),
   clustering_method = "average",
   annotation_col = annotation, annotation_row = annotation,
-  annotation_colors = list(Group = c(Control = "#7f8c8d", Favorable = "#2980b9", Unfavorable = "#e74c3c")),
-  annotation_names_row = FALSE, show_rownames = FALSE, show_colnames = FALSE,
-  treeheight_row = 0, border_color = NA,
+  annotation_colors = list(Condition = c(Normal = "#7f8c8d", Tumor = "#8e44ad")),
+  annotation_names_row = FALSE, treeheight_row = 0, border_color = NA, fontsize = 9,
   main = "Sample-sample Pearson correlation (log2 TPM), clustered"
 )
 ```
 
-To spot single outliers, summarize each sample by its **median correlation with all the others**:
-
-```{r median-correlation, echo=TRUE}
-median_cor <- tibble(sample_id = colnames(heatmap_cor),
-                     median_correlation = apply(heatmap_cor, 1, median, na.rm = TRUE)) %>%
-  left_join(samples, by = "sample_id")
-```
-
-```{r plot-median-correlation, fig.height=4.5}
-p_med <- median_cor %>%
-  ggplot(aes(x = group, y = median_correlation, color = group, text = sample_id)) +
-  geom_jitter(width = 0.2, height = 0, size = 2.2, alpha = 0.8) +
-  scale_color_manual(values = c(Control = "#7f8c8d", Favorable = "#2980b9", Unfavorable = "#e74c3c")) +
-  labs(x = NULL, y = "Median correlation with all other samples") +
-  theme_bw(base_size = 12) +
-  theme(legend.position = "none")
-
-ggplotly(p_med, tooltip = c("text", "y"))
-```
-
 <div class="alert-info">
-**Flag, don't silently remove.** Normal kidneys correlate less with the rest simply because the rest are tumors. Among tumors, a sample far below its group is worth checking (RNA quality, tumor purity, a labeling error), but removing a sample is a decision that must be justified and reported: in a cohort this small, every sample matters.
+**Two blocks.** Normals correlate strongly with each other, tumors less so with each other, and normals with tumors least of all. A sample clustering with the wrong group, or correlating poorly with everything, would deserve a second look (RNA quality, tumor purity, a labeling error); none does here.
 </div>
 
 # Summary
 
-- One matrix (`r ncol(tpm)` samples) and one sample sheet, verified to match column by column.
+- One matrix of `r ncol(tpm)` samples (6 tumors and their 6 normal kidneys) and one sample sheet, verified to match column by column.
 - `r sum(keep)` genes kept after filtering, analyzed as **log2(TPM + 1)**.
-- Tumor vs normal kidney is the dominant signal; Favorable and Unfavorable tumors overlap.
-- Six patients contribute both a tumor and a normal sample.
+- Tumor vs normal kidney dominates the data, and is consistent across the six children.
 
 Module 2 fits the limma model.
 

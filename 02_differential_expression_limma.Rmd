@@ -1,6 +1,6 @@
 ---
 title: "Module 2 — Differential Expression with limma"
-subtitle: "RNA-seq Tutorial: Linear Models, Contrasts and Empirical Bayes, Step by Step"
+subtitle: "RNA-seq Tutorial: Linear Models, Contrasts, Empirical Bayes and Paired Designs, Step by Step"
 author:
   - "**Francesco Cecere** · *Senior Bioinformatic Researcher* · AORN Santobono-Pausilipon IRCCS"
 date: "`r format(Sys.Date(), '%d %B %Y')`"
@@ -175,9 +175,9 @@ library(ggrepel)     # non-overlapping gene labels
 
 # From Module 1
 
-Module 1 built one matrix of log2(TPM + 1) for 124 Wilms tumors and 6 normal kidneys, and showed that tumor vs normal is the dominant signal while the two histologies overlap. This module asks, gene by gene, **which genes change**, and explains each step of **limma** along the way.
+Module 1 built one matrix of log2(TPM + 1) for 6 Wilms tumors and the 6 normal kidneys of the same children, and showed that tumor vs normal dominates the data. This module asks, gene by gene, **which genes change in the tumor**, and explains each step of **limma** along the way.
 
-**Plan:** the linear model → design matrix → contrasts → fitting → empirical Bayes moderation → reading the results → testing a fold-change threshold properly (`treat`) → paired samples (`duplicateCorrelation`) → Unfavorable vs Favorable.
+**Plan:** the linear model → design matrix → contrast → fitting → empirical Bayes moderation → reading the results → **adding the patient: the paired model** → testing a fold-change threshold (`treat`) → visualizing single genes.
 
 ```{r load-data, echo=TRUE}
 # Same import, matching and filtering as Module 1.
@@ -191,17 +191,17 @@ tpm <- as.matrix(bind_cols(tumor_tpm[, -1], control_tpm[, -1]))
 rownames(tpm) <- tumor_tpm$gene_name
 
 samples <- bind_rows(
-  tumor_metadata %>% transmute(sample_id = case_submitter_id, patient = case_submitter_id, group = histologic_subtype),
-  control_metadata %>% transmute(sample_id = sample_submitter_id, patient = case_submitter_id, group = "Control")
+  tumor_metadata %>% transmute(sample_id = case_submitter_id, patient = case_submitter_id, condition = "Tumor"),
+  control_metadata %>% transmute(sample_id = sample_submitter_id, patient = case_submitter_id, condition = "Normal")
 ) %>%
-  mutate(group = factor(group, levels = c("Control", "Favorable", "Unfavorable")))
+  mutate(condition = factor(condition, levels = c("Normal", "Tumor")), patient = factor(patient))
 samples <- samples[match(colnames(tpm), samples$sample_id), ]
 stopifnot(identical(samples$sample_id, colnames(tpm)))
 
-keep     <- rowSums(tpm >= 1) >= min(table(samples$group))
+keep     <- rowSums(tpm >= 1) >= min(table(samples$condition))
 log_expr <- log2(tpm[keep, ] + 1)
 
-group_colors <- c(Control = "#7f8c8d", Favorable = "#2980b9", Unfavorable = "#e74c3c")
+condition_colors <- c(Normal = "#7f8c8d", Tumor = "#8e44ad")
 ```
 
 # Part 1 — One Linear Model per Gene
@@ -212,11 +212,11 @@ $$
 y_{gj} = \mathbf{x}_j^\top \boldsymbol{\beta}_g + \varepsilon_{gj}, \qquad \varepsilon_{gj} \sim N(0, \sigma_g^2)
 $$
 
-- $\mathbf{x}_j$ describes sample $j$ (which group it belongs to): one row of the **design matrix**, the same for every gene.
-- $\boldsymbol{\beta}_g$ are the gene's **coefficients**: here, its mean log expression in each group.
-- $\sigma_g^2$ is the gene's residual **variance**: how much samples of the same group differ from one another.
+- $\mathbf{x}_j$ describes sample $j$ (its condition, later also its patient): one row of the **design matrix**, the same for every gene.
+- $\boldsymbol{\beta}_g$ are the gene's **coefficients**, e.g. its mean log expression in normal kidney and in tumor.
+- $\sigma_g^2$ is the gene's residual **variance**: how much samples differ beyond what the model explains.
 
-A comparison between groups is then a question about the coefficients, e.g. "is $\beta_{\text{Unfavorable}} - \beta_{\text{Favorable}} = 0$?". The two ideas that make limma powerful are (1) that design and contrasts can describe **any** experiment, and (2) the **empirical Bayes** step of Part 5.
+A comparison is then a question about the coefficients: "is $\beta_{\text{Tumor}} - \beta_{\text{Normal}} = 0$?". The two ideas that make limma powerful are (1) that design and contrasts can describe **any** experiment, and (2) the **empirical Bayes** step of Part 5.
 
 <div class="alert-info">
 **limma-trend vs voom.** limma has two ways to handle RNA-seq. **voom** starts from raw **counts** and computes a precision weight for every observation. **limma-trend** starts from log-expression values and lets the prior variance depend on the gene's average expression (Part 5). With raw counts, voom is preferred; with **TPM**, where counts are no longer available, **limma-trend** is the right choice, and it is what we use here.
@@ -224,79 +224,68 @@ A comparison between groups is then a question about the coefficients, e.g. "is 
 
 # Part 2 — The Design Matrix
 
-The design matrix has one row per sample and one column per coefficient. With `~ 0 + group` ("no intercept") each column is a group: a sample gets a 1 in its group's column and 0 elsewhere, so each coefficient is simply **that group's mean**.
+We start with the simplest model, which ignores the patients: `~ 0 + condition`. The design matrix has one row per sample and one column per coefficient; with `0 +` ("no intercept") each column is a condition, and each coefficient is simply **that condition's mean**.
 
 ```{r design, echo=TRUE}
-design <- model.matrix(~ 0 + group, data = samples)
-colnames(design) <- levels(samples$group)
+design <- model.matrix(~ 0 + condition, data = samples)
+colnames(design) <- levels(samples$condition)
 ```
 
 ```{r show-design}
-kable(as_tibble(design) %>% mutate(sample = samples$sample_id, .before = 1) %>%
-        slice(c(1:2, which(samples$group == "Unfavorable")[1:2], which(samples$group == "Control")[1:2])),
-      caption = "Six rows of the design matrix (one per sample).")
-kable(as_tibble(colSums(design), rownames = "column") %>% rename(samples = value),
-      caption = "Samples per column.")
+kable(as_tibble(design) %>% mutate(sample = samples$sample_id, .before = 1),
+      caption = "The design matrix: 1 marks each sample's condition.")
 ```
 
 <div class="alert-info">
-**The alternative: `~ group` (with intercept).** Then the first column is the *reference* group (Control) and the others are **differences** from it: "Favorable − Control", "Unfavorable − Control". Both parameterizations fit exactly the same model and give identical results; `~ 0 + group` is just easier to read, and every comparison is written explicitly as a contrast.
+**The alternative: `~ condition` (with intercept).** Then the first column is the *reference* (Normal) and the second is the **difference** Tumor − Normal. Both parameterizations fit exactly the same model and give identical results; `~ 0 + condition` is easier to read, and the comparison is written explicitly as a contrast.
 </div>
 
-# Part 3 — Contrasts: Writing Down the Questions
+# Part 3 — The Contrast: Writing Down the Question
 
-A **contrast** is a combination of coefficients that equals zero if there is no effect. We ask four questions at once:
+A **contrast** is a combination of coefficients that equals zero if there is no effect. Here there is one question, tumor vs normal:
 
 ```{r contrasts, echo=TRUE}
-contrast_matrix <- makeContrasts(
-  Favorable_vs_Control   = Favorable - Control,
-  Unfavorable_vs_Control = Unfavorable - Control,
-  Tumor_vs_Control       = (Favorable + Unfavorable) / 2 - Control,
-  Unfavorable_vs_Favorable = Unfavorable - Favorable,
-  levels = design
-)
+contrast_matrix <- makeContrasts(Tumor_vs_Normal = Tumor - Normal, levels = design)
 ```
 
 ```{r show-contrasts}
-kable(contrast_matrix, caption = "Contrast matrix: each column is one question, each row a coefficient.")
+kable(contrast_matrix, caption = "Contrast matrix: one column per question, one row per coefficient.")
 ```
 
-- The first two compare each histology with normal kidney.
-- `Tumor_vs_Control` compares the **average of the two tumor groups** with normal kidney: each histology weighs equally, regardless of how many samples it has.
-- `Unfavorable_vs_Favorable` compares the two histologies directly: the clinically most interesting question, and it does not involve the 6 controls at all.
+With more groups the same mechanism expresses any question: `B - A`, `C - A`, `(B + C) / 2 - A` (the average of two groups vs a third), `(C - A) - (B - A)` (an interaction)...
 
 # Part 4 — Fitting the Model
 
-`lmFit()` estimates the coefficients and residual variance of every gene; `contrasts.fit()` turns the coefficients into our four contrasts.
+`lmFit()` estimates the coefficients and residual variance of every gene; `contrasts.fit()` turns the coefficients into the contrast.
 
 ```{r fit, echo=TRUE}
 fit  <- lmFit(log_expr, design)
 fit2 <- contrasts.fit(fit, contrast_matrix)
 ```
 
-The coefficients really are group means. For `UMOD`, a gene of mature kidney tubules:
+The coefficients really are condition means. For `UMOD`, a gene of mature kidney tubules:
 
 ```{r umod-check}
 kable(
-  tibble(group = levels(samples$group),
-         mean_computed_by_hand = tapply(log_expr["UMOD", ], samples$group, mean),
+  tibble(condition = levels(samples$condition),
+         mean_computed_by_hand = tapply(log_expr["UMOD", ], samples$condition, mean),
          coefficient_from_lmFit = fit$coefficients["UMOD", ]) %>%
     mutate(across(where(is.numeric), ~ round(.x, 3))),
-  caption = "UMOD: mean log2(TPM + 1) per group, by hand and from lmFit."
+  caption = "UMOD: mean log2(TPM + 1) per condition, by hand and from lmFit."
 )
 ```
 
-UMOD is about `r round(fit$coefficients["UMOD", "Control"] - fit$coefficients["UMOD", "Favorable"])` log2 units lower in Favorable tumors than in normal kidney, i.e. roughly `r format(round(2^(fit$coefficients["UMOD", "Control"] - fit$coefficients["UMOD", "Favorable"])), big.mark = ",")`-fold.
+UMOD is about `r round(-fit2$coefficients["UMOD", 1])` log2 units lower in the tumors, i.e. roughly `r format(round(2^-fit2$coefficients["UMOD", 1]), big.mark = ",")`-fold: the tumors have lost the mature kidney tubule.
 
 # Part 5 — Empirical Bayes: Borrowing Strength Across Genes
 
-To test a contrast we divide it by its standard error, which depends on the gene's variance $s_g^2$. With few samples per group, $s_g^2$ is **unstable**: by chance some genes get a tiny variance and a huge, misleading t-statistic. limma's solution is to assume that the variances of all genes come from a common distribution, estimate that distribution **from all genes together**, and use it to stabilize each gene's estimate:
+To test a contrast we divide it by its standard error, which depends on the gene's variance $s_g^2$. With **6 samples per group**, $s_g^2$ is very **unstable**: by chance some genes get a tiny variance and a huge, misleading t-statistic. limma assumes that the variances of all genes come from a common distribution, estimates that distribution **from all genes together**, and uses it to stabilize each gene's estimate:
 
 $$
 \tilde{s}_g^2 = \frac{d_0 \, s_0^2 + d_g \, s_g^2}{d_0 + d_g}
 $$
 
-- $s_g^2$ with $d_g$ degrees of freedom: the gene's own variance (here $d_g$ = `r fit$df.residual[1]`).
+- $s_g^2$ with $d_g$ degrees of freedom: the gene's own variance (here $d_g$ = `r fit$df.residual[1]`: 12 samples − 2 coefficients).
 - $s_0^2$ with $d_0$ "prior" degrees of freedom: the typical variance of all genes, estimated from the data.
 - $\tilde{s}_g^2$: the **moderated** variance, a weighted average that pulls each gene toward the typical value. The **moderated t-statistic** uses $\tilde{s}_g$ instead of $s_g$, with $d_0 + d_g$ degrees of freedom.
 
@@ -311,260 +300,268 @@ plotSA(fit2, main = "Residual standard deviation vs average expression (red: pri
 ```
 
 <div class="alert-info">
-**How to read it.** Each point is a gene: its average log expression (x) and its residual variability (y, as $\sqrt{s_g}$). The red curve is the **prior** $s_0^2$, which here clearly depends on expression level, the reason for `trend = TRUE`: low-expressed genes are noisier. Points flagged in blue are outliers that `robust = TRUE` keeps from distorting the prior. The estimated prior degrees of freedom are $d_0 \approx$ `r round(median(fit2$df.prior), 1)`. With `r fit$df.residual[1]` residual degrees of freedom per gene, the gene's own variance dominates and the moderation is gentle; it matters most in small experiments, and for the comparisons involving only 6 controls.
+**How to read it.** Each point is a gene: its average log expression (x) and its residual variability (y, as $\sqrt{s_g}$). The red curve is the **prior**, which clearly depends on expression level, the reason for `trend = TRUE`: low-expressed genes are noisier. The estimated prior degrees of freedom are $d_0 \approx$ `r round(median(fit2$df.prior), 1)`, comparable to the `r fit$df.residual[1]` degrees of freedom of each gene: in a small experiment like this one, **the prior carries almost a third of the weight** of every variance estimate.
 </div>
+
+What moderation does, gene by gene: genes with an unusually small variance (left of the plot below) get it pulled up, those with an unusually large one get it pulled down.
+
+```{r plot-moderation, fig.width=7, fig.height=5}
+tibble(raw = fit2$sigma^2, moderated = fit2$s2.post) %>%
+  ggplot(aes(x = raw, y = moderated)) +
+  geom_point(size = 0.5, alpha = 0.3, color = "#2980b9") +
+  geom_abline(slope = 1, intercept = 0, color = "#e74c3c", linetype = "dashed") +
+  scale_x_log10() + scale_y_log10() +
+  labs(x = "Gene-wise variance s²  (log scale)", y = "Moderated variance s̃²  (log scale)",
+       title = "Moderation shrinks extreme variances toward the typical value") +
+  theme_bw(base_size = 12)
+```
+
+The practical effect: the moderated t-test finds more genes than a gene-by-gene t-test, and fewer of them are flukes of a tiny variance.
+
+```{r compare-ordinary-t, echo=TRUE}
+ordinary_t <- fit2$coefficients[, 1] / (fit2$stdev.unscaled[, 1] * fit2$sigma)
+ordinary_p <- 2 * pt(-abs(ordinary_t), df = fit2$df.residual)
+```
+
+```{r table-ordinary-t}
+kable(tibble(test = c("Ordinary t-test (gene by gene)", "Moderated t-test (limma)"),
+             `genes with adjusted p < 0.05` = c(sum(p.adjust(ordinary_p, "BH") < 0.05),
+                                                sum(p.adjust(fit2$p.value[, 1], "BH") < 0.05))),
+      caption = "Same data, same model: borrowing information across genes increases power.")
+```
 
 # Part 6 — Reading the Results
 
-`decideTests()` classifies every gene in every contrast as up, down or not significant, after **Benjamini-Hochberg** correction for multiple testing (false discovery rate 5%). We also require a fold change of at least 2 (`lfc = 1`).
+`decideTests()` classifies every gene as up, down or not significant, after **Benjamini-Hochberg** correction for multiple testing (false discovery rate 5%). We also require a fold change of at least 2 (`lfc = 1`).
 
 ```{r decide, echo=TRUE}
 padj_cutoff   <- 0.05
 log2fc_cutoff <- 1
 
-results_simple <- decideTests(fit2, p.value = padj_cutoff, lfc = log2fc_cutoff)
+results_unpaired <- decideTests(fit2, p.value = padj_cutoff, lfc = log2fc_cutoff)
+summary(results_unpaired)
 ```
 
-```{r table-decide}
-kable(as.data.frame.matrix(summary(results_simple)) %>% rownames_to_column("status"),
-      caption = "Genes per contrast (adjusted p < 0.05 and |log2FC| > 1).")
-```
-
-`topTable()` returns the full table of one contrast, ranked by significance:
+`topTable()` returns the full table, ranked by significance:
 
 ```{r toptable, echo=TRUE}
-top_tumor <- topTable(fit2, coef = "Tumor_vs_Control", number = Inf, sort.by = "P")
-```
-
-```{r show-toptable}
-datatable(
-  top_tumor %>% rownames_to_column("gene") %>% slice_head(n = 200) %>%
-    mutate(across(c(logFC, AveExpr, t, B), ~ round(.x, 2)), across(c(P.Value, adj.P.Val), ~ signif(.x, 3))),
-  extensions = "Buttons",
-  options = list(dom = "Bfrtip", buttons = c("csv", "excel"), pageLength = 10),
-  rownames = FALSE,
-  caption = "Top 200 genes, Tumor vs Control."
-)
+top_unpaired <- topTable(fit2, coef = "Tumor_vs_Normal", number = Inf, sort.by = "P")
 ```
 
 | column | meaning |
 |--------|---------|
-| `logFC` | the contrast's value: log2 fold change |
+| `logFC` | log2 fold change, tumor vs normal |
 | `AveExpr` | mean log2 expression over all samples |
 | `t` | moderated t-statistic |
 | `P.Value`, `adj.P.Val` | raw and Benjamini-Hochberg adjusted p-value |
 | `B` | log-odds that the gene is differentially expressed |
 
-## Which Genes Are Shared? A Venn Diagram
+<div class="alert-info">
+**Thousands of genes: expected.** A tumor differs from normal tissue in many basic ways at once (proliferation, cell types, blood supply, immune cells), so tumor-vs-normal comparisons routinely change thousands of genes. What matters is whether the top genes make biological sense (Part 9).
+</div>
 
-```{r plot-venn, fig.width=7, fig.height=6}
-vennDiagram(results_simple[, c("Favorable_vs_Control", "Unfavorable_vs_Control")],
-            include = c("up", "down"), counts.col = c("#e74c3c", "#2980b9"),
-            names = c("Favorable vs Control", "Unfavorable vs Control"), cex = c(1, 0.9, 0.8))
+# Part 7 — Adding the Patient: The Paired Model
+
+The model above treats the 12 samples as independent, but they are 6 **pairs**: each child's tumor and normal kidney share the child's genetic background and the way the samples were handled. A gene can be naturally high in one child and low in another; those differences between children inflate $s_g^2$ and hide the tumor effect.
+
+The fix is to add the patient to the design: **`~ patient + condition`**. Each child gets their own baseline level, and the tumor effect is estimated **within each child**.
+
+```{r design-paired, echo=TRUE}
+design_paired <- model.matrix(~ patient + condition, data = samples)
+```
+
+```{r show-design-paired}
+kable(as_tibble(design_paired) %>% mutate(sample = samples$sample_id, .before = 1) %>%
+        rename_with(~ str_remove(.x, "TARGET-50-")),
+      caption = "Paired design matrix: an intercept (the first child's normal kidney), one column per other child, and conditionTumor.")
 ```
 
 <div class="alert-info">
-**Most of the tumor signal is shared.** The large overlap (red = up, blue = down in the tumor) shows that what separates a Wilms tumor from normal kidney is largely the same in both histologies: loss of mature kidney genes, gain of the embryonic and proliferative programs.
+**Reading the paired design.** The intercept is the baseline of the first child; each `patient...` column shifts the baseline to another child; `conditionTumor` is the **tumor effect, averaged over the six within-child differences**. This is the multi-gene, moderated version of a **paired t-test**. The cost: 7 coefficients instead of 2, so each gene has `r nrow(samples) - ncol(design_paired)` residual degrees of freedom instead of `r fit$df.residual[1]`.
 </div>
+
+```{r fit-paired, echo=TRUE}
+fit_paired <- lmFit(log_expr, design_paired)
+fit_paired <- eBayes(fit_paired, trend = TRUE, robust = TRUE)
+
+top_paired     <- topTable(fit_paired, coef = "conditionTumor", number = Inf, sort.by = "P")
+results_paired <- decideTests(fit_paired, p.value = padj_cutoff, lfc = log2fc_cutoff)[, "conditionTumor"]
+```
+
+```{r compare-models, echo=TRUE}
+comparison <- inner_join(
+  top_unpaired %>% rownames_to_column("gene") %>% select(gene, logFC_unpaired = logFC, t_unpaired = t),
+  top_paired   %>% rownames_to_column("gene") %>% select(gene, logFC_paired = logFC, t_paired = t),
+  by = "gene"
+)
+stronger_when_paired <- mean(abs(comparison$t_paired) > abs(comparison$t_unpaired))
+```
+
+```{r table-compare-models}
+kable(
+  tibble(model = c("~ 0 + condition (unpaired)", "~ patient + condition (paired)"),
+         `residual df per gene` = c(fit$df.residual[1], fit_paired$df.residual[1]),
+         up = c(sum(results_unpaired == 1), sum(results_paired == 1)),
+         down = c(sum(results_unpaired == -1), sum(results_paired == -1))),
+  caption = "DEGs (adjusted p < 0.05, |log2FC| > 1) with and without the patient in the model."
+)
+```
+
+```{r plot-compare-models, fig.width=7, fig.height=6}
+comparison %>%
+  ggplot(aes(x = abs(t_unpaired), y = abs(t_paired))) +
+  geom_point(size = 0.5, alpha = 0.3, color = "#8e44ad") +
+  geom_abline(slope = 1, intercept = 0, color = "#e74c3c", linetype = "dashed") +
+  coord_cartesian(xlim = c(0, 30), ylim = c(0, 30)) +
+  labs(x = "|moderated t|, unpaired model", y = "|moderated t|, paired model",
+       title = "Above the red line: stronger evidence once the patient is in the model") +
+  theme_bw(base_size = 12)
+```
+
+<div class="alert-info">
+**What pairing buys.** The fold changes are identical in the two models (with one tumor and one normal per child, the average within-child difference equals the difference of the means). What changes is the **noise**: **`r round(100 * stronger_when_paired)`%** of genes get a larger |t| in the paired model, because the differences between children are no longer counted as noise, even though each gene has fewer degrees of freedom left. The number of DEGs barely moves here because tumor vs normal kidney is an enormous effect; pairing matters most for **subtle** effects, and it is the correct model whenever samples come in pairs. From now on we use the paired model.
+</div>
+
+<div class="alert-info">
+**Another way to pair: `duplicateCorrelation()`.** Instead of one coefficient per patient, limma can treat the patient as a **random block**: `duplicateCorrelation(log_expr, design, block = samples$patient)` estimates how correlated two samples of the same child are, and `lmFit(..., block = samples$patient, correlation = ...)` uses it. This is preferable when only *some* samples are paired (a coefficient for every unpaired patient would waste degrees of freedom); when every sample is paired, as here, the patient coefficients of `~ patient + condition` are the standard choice.
+</div>
+
+```{r export, echo=TRUE}
+dir.create("results", showWarnings = FALSE)
+top_paired %>% rownames_to_column("gene") %>% write_csv("results/limma_tumor_vs_normal_paired.csv")
+```
+
+# Part 8 — Testing a Fold-Change Threshold Properly: `treat()`
+
+Above, a gene is a DEG if its adjusted p-value is below 0.05 **and** its estimated |log2FC| exceeds 1. This is very common, but the p-value tests "log2FC = 0", not "|log2FC| ≤ 1": a gene whose true change is 1.5-fold, estimated at 2.1-fold by chance, passes both filters. `treat()` tests the right hypothesis directly: **is |log2FC| significantly greater than the threshold?**
+
+```{r treat, echo=TRUE}
+fit_treat     <- treat(lmFit(log_expr, design_paired), lfc = log2fc_cutoff, trend = TRUE, robust = TRUE)
+results_treat <- decideTests(fit_treat, p.value = padj_cutoff)[, "conditionTumor"]
+```
+
+```{r table-treat}
+kable(tibble(method = c("p-value + |log2FC| filter", "treat(lfc = 1)"),
+             up = c(sum(results_paired == 1), sum(results_treat == 1)),
+             down = c(sum(results_paired == -1), sum(results_treat == -1))),
+      caption = "DEGs with the two approaches (paired model).")
+```
+
+<div class="alert-info">
+**treat is stricter, and honest.** It keeps only genes for which the data show a change *larger* than two-fold with confidence, so the list is much shorter. Use the post-hoc filter for exploration; use `treat()` when the fold change itself is part of the claim ("more than two-fold up in the tumor").
+</div>
+
+# Part 9 — Looking at the Results
 
 ## Mean-Difference and Volcano Plots
 
-```{r plot-md, fig.width=11, fig.height=5}
-par(mfrow = c(1, 2))
-plotMD(fit2, coef = "Tumor_vs_Control", status = results_simple[, "Tumor_vs_Control"],
-       values = c(1, -1), hl.col = c("#e74c3c", "#2980b9"), main = "Tumor vs Control")
-plotMD(fit2, coef = "Unfavorable_vs_Favorable", status = results_simple[, "Unfavorable_vs_Favorable"],
-       values = c(1, -1), hl.col = c("#e74c3c", "#2980b9"), main = "Unfavorable vs Favorable")
+```{r plot-md, fig.width=8, fig.height=5.5}
+plotMD(fit_paired, coef = "conditionTumor", status = results_paired, values = c(1, -1),
+       hl.col = c("#e74c3c", "#2980b9"), main = "Tumor vs Normal (paired): mean-difference plot")
+abline(h = c(-1, 1), lty = 2, col = "grey40")
 ```
 
-```{r volcano-data, echo=TRUE}
-volcano_table <- map_dfr(colnames(contrast_matrix), function(contrast) {
-  topTable(fit2, coef = contrast, number = Inf) %>%
-    rownames_to_column("gene") %>%
-    mutate(contrast = contrast,
-           status = case_when(adj.P.Val < padj_cutoff & logFC >  log2fc_cutoff ~ "Up",
-                              adj.P.Val < padj_cutoff & logFC < -log2fc_cutoff ~ "Down",
-                              TRUE ~ "Not DEG"))
-}) %>%
-  mutate(contrast = factor(contrast, levels = colnames(contrast_matrix)))
-```
+```{r plot-volcano, fig.width=9, fig.height=6.5}
+volcano <- top_paired %>% rownames_to_column("gene") %>%
+  mutate(status = case_when(adj.P.Val < padj_cutoff & logFC >  log2fc_cutoff ~ "Up",
+                            adj.P.Val < padj_cutoff & logFC < -log2fc_cutoff ~ "Down",
+                            TRUE ~ "Not DEG"))
+volcano_labels <- volcano %>% filter(status != "Not DEG") %>%
+  group_by(status) %>% slice_min(adj.P.Val, n = 10, with_ties = FALSE) %>% ungroup()
 
-```{r plot-volcano, fig.width=11, fig.height=9}
-volcano_labels <- volcano_table %>% filter(status != "Not DEG") %>%
-  group_by(contrast) %>% slice_min(adj.P.Val, n = 8, with_ties = FALSE) %>% ungroup()
-
-volcano_table %>%
+volcano %>%
   ggplot(aes(x = logFC, y = -log10(adj.P.Val), color = status)) +
-  geom_point(size = 0.6, alpha = 0.5) +
+  geom_point(size = 0.7, alpha = 0.5) +
   geom_vline(xintercept = c(-log2fc_cutoff, log2fc_cutoff), linetype = "dashed", color = "grey40") +
   geom_hline(yintercept = -log10(padj_cutoff), linetype = "dashed", color = "grey40") +
-  geom_text_repel(data = volcano_labels, aes(label = gene), size = 2.8, color = "black", max.overlaps = Inf) +
+  geom_text_repel(data = volcano_labels, aes(label = gene), size = 3, color = "black", max.overlaps = Inf) +
   scale_color_manual(values = c(Up = "#e74c3c", Down = "#2980b9", `Not DEG` = "grey75")) +
-  facet_wrap(~ contrast, scales = "free") +
-  labs(x = "log2 fold change", y = "-log10(adjusted p-value)", color = NULL) +
-  theme_bw(base_size = 11) +
+  labs(x = "log2 fold change (tumor vs normal)", y = "-log10(adjusted p-value)", color = NULL) +
+  theme_bw(base_size = 12) +
   theme(legend.position = "bottom")
+```
+
+```{r table-top}
+datatable(
+  top_paired %>% rownames_to_column("gene") %>% slice_head(n = 300) %>%
+    mutate(across(c(logFC, AveExpr, t, B), ~ round(.x, 2)), across(c(P.Value, adj.P.Val), ~ signif(.x, 3))),
+  extensions = "Buttons",
+  options = list(dom = "Bfrtip", buttons = c("csv", "excel"), pageLength = 10),
+  rownames = FALSE,
+  caption = "Top 300 genes, tumor vs normal (paired model). The full table is in results/."
+)
 ```
 
 ## A Biological Sanity Check
 
 ```{r markers}
 marker_genes <- c(SIX1 = "nephron progenitor: up", SIX2 = "nephron progenitor: up", CITED1 = "nephron progenitor: up",
-                  LIN28B = "embryonic: up", IGF2 = "11p15.5 imprinted: up",
+                  IGF2 = "11p15.5 imprinted: up",
                   UMOD = "mature tubule: down", AQP2 = "mature tubule: down", SLC22A2 = "mature tubule: down")
 
 kable(
-  topTable(fit2, coef = "Tumor_vs_Control", number = Inf)[names(marker_genes), c("logFC", "adj.P.Val")] %>%
+  top_paired[names(marker_genes), c("logFC", "adj.P.Val")] %>%
     rownames_to_column("gene") %>%
     mutate(expected = marker_genes[gene], logFC = round(logFC, 2), adj.P.Val = signif(adj.P.Val, 3)),
-  caption = "Known Wilms tumor biology, Tumor vs Control."
+  caption = "Known Wilms tumor biology, tumor vs normal."
 )
 ```
 
-Embryonic kidney genes up and mature tubule genes down: the model measures real biology.
+Wilms tumor arises from **embryonic kidney** tissue that failed to mature: the nephron progenitor genes (`SIX1`, `SIX2`, `CITED1`) and the growth factor `IGF2` (at the 11p15.5 imprinted locus) are up, the mature tubule genes are down. The model measures real biology.
 
-# Part 7 — Testing a Fold-Change Threshold Properly: `treat()`
+## Gene by Gene, Child by Child
 
-Above, we called a gene a DEG if its adjusted p-value was below 0.05 **and** its estimated |log2FC| exceeded 1. This is very common, but the p-value tests "log2FC = 0", not "|log2FC| ≤ 1". A gene whose true change is 1.5-fold, estimated at 2.1-fold by chance, passes both filters.
+Lines join each child's normal and tumor sample: the change is consistent **within** children even when baseline levels differ **between** them.
 
-`treat()` tests the right hypothesis directly: **is |log2FC| significantly greater than the threshold?**
+```{r plot-paired-genes, fig.width=11, fig.height=6.5}
+top_up   <- volcano %>% filter(status == "Up")   %>% slice_min(adj.P.Val, n = 3, with_ties = FALSE) %>% pull(gene)
+top_down <- volcano %>% filter(status == "Down") %>% slice_min(adj.P.Val, n = 3, with_ties = FALSE) %>% pull(gene)
 
-```{r treat, echo=TRUE}
-fit_treat <- treat(contrasts.fit(fit, contrast_matrix), lfc = log2fc_cutoff, trend = TRUE, robust = TRUE)
-results_treat <- decideTests(fit_treat, p.value = padj_cutoff)
-```
-
-```{r table-treat}
-compare_counts <- function(res, label) {
-  as.data.frame.matrix(summary(res)) %>% rownames_to_column("status") %>%
-    filter(status != "NotSig") %>% mutate(method = label, .before = 1)
-}
-kable(bind_rows(compare_counts(results_simple, "p-value + |log2FC| filter"),
-                compare_counts(results_treat, "treat(lfc = 1)")),
-      caption = "DEGs per contrast with the two approaches.")
-```
-
-<div class="alert-info">
-**treat is stricter, and honest.** It keeps only genes for which the data show a change *larger* than two-fold with confidence, so the lists are much shorter. Use the post-hoc filter for exploration; use `treat()` when the fold change itself is part of the claim ("more than two-fold up in the tumor"). Note that `treat()` with `lfc = 1` finds nothing between the two histologies: no gene differs by more than two-fold with confidence.
-</div>
-
-# Part 8 — Paired Samples: `duplicateCorrelation()`
-
-Six normal kidneys come from patients whose tumor is also in the dataset. Two samples of the same child share genetic background and handling, so they are **correlated**, and the model above treats them as independent. limma handles this with a **random block effect**: `duplicateCorrelation()` estimates how correlated the samples of the same patient are, and `lmFit()` uses that correlation.
-
-```{r duplicate-correlation, echo=TRUE}
-# Takes about a minute: the correlation is estimated gene by gene, then summarized.
-dup_cor <- duplicateCorrelation(log_expr, design, block = samples$patient)
-dup_cor$consensus.correlation
-```
-
-```{r fit-blocked, echo=TRUE}
-fit_blocked <- lmFit(log_expr, design, block = samples$patient, correlation = dup_cor$consensus.correlation)
-fit_blocked <- eBayes(contrasts.fit(fit_blocked, contrast_matrix), trend = TRUE, robust = TRUE)
-results_blocked <- decideTests(fit_blocked, p.value = padj_cutoff, lfc = log2fc_cutoff)
-```
-
-```{r table-blocked}
-kable(bind_rows(compare_counts(results_simple, "independent samples"),
-                compare_counts(results_blocked, "patient as block")),
-      caption = "DEGs per contrast, with and without accounting for the paired patients.")
-```
-
-<div class="alert-info">
-**Why a block and not a patient coefficient?** Only 6 of 124 patients have two samples, so a fixed coefficient per patient would waste most degrees of freedom on singletons. A **block** says "samples of the same patient are correlated by ρ" and estimates a single ρ (here `r round(dup_cor$consensus.correlation, 2)`) from all genes. The results change little, because only 6 pairs are involved, but the model now describes how the samples were actually collected, so we keep it as the final model.
-</div>
-
-```{r export, echo=TRUE}
-dir.create("results", showWarnings = FALSE)
-for (contrast in colnames(contrast_matrix)) {
-  topTable(fit_blocked, coef = contrast, number = Inf, sort.by = "P") %>%
-    rownames_to_column("gene") %>%
-    write_csv(file.path("results", paste0("limma_", contrast, ".csv")))
-}
-list.files("results")
-```
-
-# Part 9 — Unfavorable vs Favorable Histology
-
-The comparison with the most clinical interest involves no controls at all: 42 anaplastic vs 82 favorable tumors.
-
-```{r unf-vs-fav, echo=TRUE}
-top_histology <- topTable(fit_blocked, coef = "Unfavorable_vs_Favorable", number = Inf, sort.by = "P")
-```
-
-```{r table-unf-vs-fav}
-datatable(
-  top_histology %>% rownames_to_column("gene") %>% filter(adj.P.Val < padj_cutoff) %>%
-    mutate(across(c(logFC, AveExpr, t, B), ~ round(.x, 2)), across(c(P.Value, adj.P.Val), ~ signif(.x, 3))),
-  extensions = "Buttons",
-  options = list(dom = "Bfrtip", buttons = c("csv", "excel"), pageLength = 10),
-  rownames = FALSE,
-  caption = "Genes with adjusted p < 0.05, Unfavorable vs Favorable (no fold-change filter)."
-)
-```
-
-`r sum(top_histology$adj.P.Val < padj_cutoff)` genes reach adjusted p < 0.05, but only `r sum(top_histology$adj.P.Val < padj_cutoff & abs(top_histology$logFC) > log2fc_cutoff)` of them change more than two-fold: the two histologies differ in **many small shifts** rather than a few large ones. Module 3 shows that those small shifts add up to coherent biological programs.
-
-## The p53 Axis
-
-One gene stands out: **TP53** itself is lower in anaplastic tumors, and so are two of its classic transcriptional targets, **CDKN1A** (p21, the cell-cycle brake p53 switches on) and **MDM2** (the p53 negative feedback regulator).
-
-```{r plot-p53, fig.width=11, fig.height=4.5}
-p53_genes <- c("TP53", "CDKN1A", "MDM2")
-
-as_tibble(t(log_expr[p53_genes, ]), rownames = "sample_id") %>%
+as_tibble(t(log_expr[c(top_up, top_down), ]), rownames = "sample_id") %>%
   left_join(samples, by = "sample_id") %>%
-  pivot_longer(all_of(p53_genes), names_to = "gene", values_to = "log_expr") %>%
-  mutate(gene = factor(gene, levels = p53_genes)) %>%
-  ggplot(aes(x = group, y = log_expr, fill = group)) +
-  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
-  geom_jitter(width = 0.15, size = 0.8, alpha = 0.5) +
-  scale_fill_manual(values = group_colors) +
-  facet_wrap(~ gene, scales = "free_y") +
-  labs(x = NULL, y = "log2(TPM + 1)") +
+  pivot_longer(all_of(c(top_up, top_down)), names_to = "gene", values_to = "log_expr") %>%
+  mutate(gene = factor(gene, levels = c(top_up, top_down))) %>%
+  ggplot(aes(x = condition, y = log_expr)) +
+  geom_line(aes(group = patient), color = "grey60") +
+  geom_point(aes(color = condition), size = 2.5) +
+  scale_color_manual(values = condition_colors) +
+  facet_wrap(~ gene, scales = "free_y", nrow = 2) +
+  labs(x = NULL, y = "log2(TPM + 1)",
+       title = "Top 3 up (first row) and top 3 down (second row) genes; one line per child") +
   theme_bw(base_size = 12) +
   theme(legend.position = "none")
 ```
 
-```{r table-p53}
-kable(top_histology[p53_genes, c("logFC", "adj.P.Val")] %>% rownames_to_column("gene") %>%
-        mutate(logFC = round(logFC, 2), adj.P.Val = signif(adj.P.Val, 3)),
-      caption = "The p53 axis, Unfavorable vs Favorable.")
-```
+## Heatmap of the Top Genes
 
-<div class="alert-info">
-**Connecting expression to mutation.** Anaplastic Wilms tumors very frequently carry **TP53 mutations** (the Exome sequencing tutorial finds them in most Unfavorable tumors and in none of the Favorable ones). Many TP53 mutations are truncating, and the mutant mRNA is then degraded (*nonsense-mediated decay*), or the second allele is lost: both lower TP53 expression. A p53 protein that no longer works also stops switching on its targets, which is why **CDKN1A** and **MDM2** fall too. Two independent data types tell the same story.
-</div>
-
-```{r heatmap-histology, fig.width=10, fig.height=7}
-top_hist_genes <- top_histology %>% rownames_to_column("gene") %>% slice_min(adj.P.Val, n = 30) %>% pull(gene)
-tumors <- samples$group != "Control"
+```{r plot-heatmap, fig.width=9, fig.height=9}
+top_genes <- volcano %>% filter(status != "Not DEG") %>%
+  group_by(status) %>% slice_min(adj.P.Val, n = 25, with_ties = FALSE) %>% pull(gene)
+labels <- paste(str_remove(samples$patient, "TARGET-50-"), samples$condition)
+heat <- log_expr[top_genes, ]
+colnames(heat) <- labels
 
 pheatmap(
-  log_expr[top_hist_genes, tumors],
+  heat,
   scale = "row",
   color = colorRampPalette(c("#2980b9", "white", "#e74c3c"))(100),
-  breaks = seq(-3, 3, length.out = 101),
-  clustering_distance_cols = "correlation", clustering_method = "average",
-  annotation_col = data.frame(Histology = droplevels(samples$group[tumors]), row.names = samples$sample_id[tumors]),
-  annotation_colors = list(Histology = group_colors[c("Favorable", "Unfavorable")]),
-  show_colnames = FALSE, fontsize_row = 7, border_color = NA, treeheight_row = 15,
-  main = "Top 30 genes, Unfavorable vs Favorable (row z-score, tumors only)"
+  breaks = seq(-2.5, 2.5, length.out = 101),
+  clustering_distance_rows = "correlation", clustering_distance_cols = "correlation",
+  clustering_method = "average",
+  annotation_col = data.frame(Condition = samples$condition, row.names = labels),
+  annotation_colors = list(Condition = condition_colors),
+  fontsize_row = 7, fontsize_col = 8, border_color = NA, treeheight_row = 15,
+  main = "Top 50 genes, tumor vs normal (row z-score of log2 TPM)"
 )
 ```
-
-<div class="alert-info">
-**No clean split.** Even the top genes separate the two histologies only partially: many Unfavorable tumors look like Favorable ones and vice versa. Histology is a clinical classification of the *worst* area of a tumor (anaplasia can be focal), while bulk RNA-seq averages the whole sample. This is a good reminder that a statistically significant difference between group means is not the same as a gene that **classifies** individual patients.
-</div>
 
 # Summary
 
 - limma fits **one linear model per gene**; the **design matrix** describes the samples and **contrasts** state the questions.
-- **Empirical Bayes** (`eBayes`, with `trend = TRUE` for TPM) stabilizes the variance of every gene by borrowing information across genes.
-- `decideTests()` and `topTable()` give the results; **`treat()`** tests a fold-change threshold properly.
-- **`duplicateCorrelation()`** accounts for samples from the same patient.
-- Tumor vs normal kidney changes thousands of genes; Unfavorable vs Favorable changes few genes by much, with **TP53 and its targets** among the clearest.
-- Full tables are saved in `results/` for Module 3.
+- **Empirical Bayes** (`eBayes`, with `trend = TRUE` for TPM) stabilizes each gene's variance by borrowing information from all genes: essential with 6 samples per group.
+- Adding the **patient** (`~ patient + condition`) turns the analysis into a paired comparison and removes the differences between children from the noise.
+- **`treat()`** tests a fold-change threshold properly.
+- The full paired results are in `results/limma_tumor_vs_normal_paired.csv` for Module 3.
 
 ---
 
